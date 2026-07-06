@@ -37,7 +37,7 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
 
     setAcceptDrops(true);
 
-    setWindowTitle("FinWizard - Мастер обработки данных");
+    setWindowTitle("FinWizard dll v1.0.0");
     setWindowIcon(QIcon(":/res/icon.png"));
 
     if (!m_pluginManager) {
