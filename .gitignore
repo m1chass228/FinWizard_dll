@@ -1,0 +1,17 @@
+# Сборка
+build/
+bin/
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+
+# Настройки Qt Creator
+*.user
+*.pro.user
+.qtc_clangd/
+
+# Кэш приложения (раз ты его хранишь в проекте)
+plugins-cache/
+build/
