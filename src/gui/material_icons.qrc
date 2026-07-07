@@ -1,0 +1,9 @@
+<RCC>
+    <qresource prefix="/">
+        <file>res/folder_configs_google.svg</file>
+        <file>res/file_export_google.svg</file>
+        <file>res/folder_open_google.svg</file>
+        <file>res/refresh_google.svg</file>
+        <file>res/settings_google.svg</file>
+    </qresource>
+</RCC>
