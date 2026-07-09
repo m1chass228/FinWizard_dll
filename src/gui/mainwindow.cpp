@@ -24,6 +24,8 @@
 #include <QStandardItem>
 #include <QDropEvent>
 #include <QPainter>
+#include <QMimeData>
+#include <QUrl>
 
 #include <quazip/quazip.h>
 #include <quazip/quazipfile.h>
@@ -46,6 +48,38 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
         return;
     }
 
+    // Кнопка выключена, пока не выбран конфиг
+    //ui->startButton->setEnabled(false);
+
+    // Включаем поддержку HTML тегов, так как acceptRichText в .ui выключен
+    ui->logTextEdit->setAcceptRichText(true);
+
+    logMessage("Программа запущена. Конфиги загружены из кэша.", false);
+
+    // --- 7. ЗАПРЕТ НА ЗАПРЕЩЕННЫЕ СИМВОЛЫ ---
+    QRegularExpression fileRegex("[^\\*\\?\\\"<>\\|/:]*");
+    QRegularExpressionValidator *validator = new QRegularExpressionValidator(fileRegex, this);
+    ui->fileName->setValidator(validator);
+
+    // Пошаговый запуск
+    initSettingsAndPaths();       // 1. Считали пути в m_configsPath и m_inputPath
+    setupCoreComponents();        // 2. Создали таймер и вотчер
+    setupWidgets();               // 3. Стили и mouse tracking для ComboBox
+    setupConnections();           // 4. Связали всё сигналами
+
+    // Первая отрисовка
+    updateConfigList();
+    updateXlsxList();
+    updateInterfaceIcons();
+}
+
+MainWindow::~MainWindow()
+{
+    delete ui;
+}
+
+void MainWindow::initSettingsAndPaths()
+{
     // --- 1. ПУТИ И НАСТРОЙКИ ---
     QSettings settings("FinWizard", "Settings");
 
@@ -62,25 +96,111 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
     defaultInputPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input";
 #endif
 
-    QString configsPath = settings.value("cache/path", defaultCachePath).toString();
-    QString inputPath = settings.value("inputFolder", defaultInputPath).toString();
+    m_configsPath = settings.value("cache/path", defaultCachePath).toString();
+    m_inputPath = settings.value("inputFolder", defaultInputPath).toString();
 
-    QDir().mkpath(configsPath);
-    QDir().mkpath(inputPath);
+    QDir().mkpath(m_configsPath);
+    QDir().mkpath(m_inputPath);
 
     // --- 2. ИНИЦИАЛИЗАЦИЯ МЕНЕДЖЕРА ---
-    m_pluginManager->setCacheBasePath(configsPath);
+    m_pluginManager->setCacheBasePath(m_configsPath);
     m_pluginManager->refreshPlugins();
+}
 
-    // --- 3. WATCHER И ТАЙМЕР ---
+void MainWindow::setupCoreComponents()
+{
     m_watchdogTimer = new QTimer(this);
     m_watchdogTimer->setSingleShot(true);
     m_watchdogTimer->setInterval(500);
 
     m_watcher = new QFileSystemWatcher(this);
-    m_watcher->addPath(configsPath);
-    m_watcher->addPath(inputPath);
+    m_watcher->addPath(m_configsPath);
+    m_watcher->addPath(m_inputPath);
+}
 
+void MainWindow::setupWidgets()
+{
+    QListView* popupListView = qobject_cast<QListView*>(ui->configComboBox->view());
+    if (popupListView) {
+        popupListView->setMouseTracking(true); // Включаем отслеживание мыши для hover-эффектов
+
+        // Включаем поддержку кастомных стилей для отображения элементов
+        popupListView->setStyleSheet(
+            "QListView::item {"
+            "    padding: 8px;"
+            "    border-bottom: 1px solid rgba(255,255,255,0.05);"
+            "}"
+            "QListView::item:hover {"
+            "    background-color: #2c3e50;"
+            "}"
+            );
+    }
+
+    // --- 4. КОНТЕКСТНОЕ МЕНЮ ---
+    ui->xlsxList->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(ui->xlsxList, &QListWidget::customContextMenuRequested, this, &MainWindow::showXlsxContextMenu);
+
+    // --- НАСТРОЙКА УДАЛЕНИЯ ПЛАГИНОВ ПО ПРАВОМУ КЛИКУ В СПИСКЕ ---
+    if (ui->configComboBox && ui->configComboBox->view()) {
+        QAbstractItemView* comboBoxView = ui->configComboBox->view();
+
+        // Разрешаем кастомное контекстное меню для всплывающего списка
+        comboBoxView->setContextMenuPolicy(Qt::CustomContextMenu);
+
+        connect(comboBoxView, &QAbstractItemView::customContextMenuRequested, this, [this](const QPoint &pos) {
+            QAbstractItemView* view = ui->configComboBox->view();
+            QModelIndex index = view->indexAt(pos);
+
+            if (!index.isValid()) return;
+
+            // Извлекаем ID плагина, который мы сохраняли в UserRole (или currentData)
+            int id = index.data(Qt::UserRole).toInt();
+
+            // Запрещаем удалять служебные элементы (например, заглушки или кнопку "Добавить")
+            if (id <= 0) return;
+
+            QString pluginName = index.data(Qt::DisplayRole).toString();
+
+            // Создаем контекстное меню
+            QMenu contextMenu(this);
+
+            // Подкрашиваем иконку мусорки под текущую тему (используем твою лямбду из updateInterfaceIcons, если она доступна)
+            // Если лямбда недоступна глобально, просто берем исходный SVG:
+            QIcon trashIcon(":/res/trash_google.svg");
+
+            QAction *deleteAction = contextMenu.addAction(trashIcon, QString("Удалить \"%1\"").arg(pluginName));
+
+            // Показываем меню в точке клика
+            QAction *selectedAction = contextMenu.exec(view->mapToGlobal(pos));
+
+            if (selectedAction == deleteAction) {
+                // Скрываем сам комбобокс, чтобы QMessageBox не баговал с фокусом
+                ui->configComboBox->hidePopup();
+
+                // Вызываем подтверждение удаления
+                auto res = QMessageBox::question(this, "Удаление плагина",
+                                                 QString("Вы уверены, что хотите полностью удалить плагин \"%1\" и все его файлы?").arg(pluginName),
+                                                 QMessageBox::Yes | QMessageBox::No);
+
+                if (res == QMessageBox::Yes) {
+                    // Вызываем удаление через твой PluginManager
+                    m_pluginManager->removeConfig(id);
+
+                    logMessage("Плагин успешно удален: " + pluginName, false);
+
+                    // Обновляем комбобокс (вызываем твою функцию)
+                    updateConfigList();
+
+                    // Сбрасываем выбор на самый первый элемент
+                    ui->configComboBox->setCurrentIndex(0);
+                }
+            }
+        });
+    }
+}
+
+void MainWindow::setupConnections()
+{
     connect(m_watcher, &QFileSystemWatcher::directoryChanged, this, &MainWindow::onDirectoryChanged);
 
     // Когда таймер дотикает (прошло 500мс после последнего изменения в папках)
@@ -107,41 +227,10 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
     connect(ui->openXlsxFolderButton, &QPushButton::clicked, this, &MainWindow::onOpenXlsxFolderClicked);
     connect(ui->refreshXlsxButton, &QPushButton::clicked, this, &MainWindow::updateXlsxList);
 
-    // --- 5. КОНТЕКСТНОЕ МЕНЮ ---
-    ui->xlsxList->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(ui->xlsxList, &QListWidget::customContextMenuRequested, this, &MainWindow::showXlsxContextMenu);
-
-    // Первая отрисовка
-    updateConfigList();
-    updateXlsxList();
-
-    // Кнопка выключена, пока не выбран конфиг
-    //ui->startButton->setEnabled(false);
-
-    // Включаем поддержку HTML тегов, так как acceptRichText в .ui выключен
-    ui->logTextEdit->setAcceptRichText(true);
-
-    logMessage("Программа запущена. Конфиги загружены из кэша.", false);
-
-    // --- 6. ПОДПИСКА НА СИГНАЛЫ ДВИЖКА (через менеджер) ---
+    // --- 5. ПОДПИСКА НА СИГНАЛЫ ДВИЖКА (через менеджер) ---
     connect(m_pluginManager, &PluginManager::pluginLogReceived, this, &MainWindow::onPluginLogReceived);
     connect(m_pluginManager, &PluginManager::pluginReadyChanged, this, &MainWindow::onPluginReadyChanged);
-
-    // --- 7. ЗАПРЕТ НА ЗАПРЕЩЕННЫЕ СИМВОЛЫ ---
-    QRegularExpression fileRegex("[^\\*\\?\\\"<>\\|/:]*");
-    QRegularExpressionValidator *validator = new QRegularExpressionValidator(fileRegex, this);
-    ui->fileName->setValidator(validator);
-
-    updateInterfaceIcons();
 }
-
-MainWindow::~MainWindow()
-{
-    delete ui;
-}
-
-#include <QMimeData>
-#include <QUrl>
 
 // Вспомогательный метод для очистки стилей
 void MainWindow::clearHoverStyles()
@@ -367,6 +456,42 @@ void MainWindow::showXlsxContextMenu(const QPoint &pos)
         } else if (selectedAction == refreshAction) {
             updateXlsxList();
         }
+    }
+}
+
+void MainWindow::onDeleteConfigClicked()
+{
+    int selectedId = ui->configComboBox->currentData().toInt();
+
+    // Запрещаем удалять заглушку или пункт "Добавить..."
+    if (selectedId <= 0) {
+        QMessageBox::warning(this, "Предупреждение", "Выберите валидный плагин для удаления.");
+        return;
+    }
+
+    // Проверяем, не заблокирован ли интерфейс (работает ли плагин)
+    if (!ui->startButton->isEnabled()) {
+        QMessageBox::warning(this, "Ошибка", "Нельзя удалить плагин во время его выполнения или сборки окружения.");
+        return;
+    }
+
+    QString configName = ui->configComboBox->currentText();
+
+    auto res = QMessageBox::question(this, "Удаление плагина",
+                                     QString("Вы уверены, что хотите полностью удалить плагин '%1' и все его файлы?").arg(configName),
+                                     QMessageBox::Yes | QMessageBox::No);
+
+    if (res == QMessageBox::Yes) {
+        // Вызываем удаление через менеджер
+        m_pluginManager->removeConfig(selectedId);
+
+        logMessage("Плагин успешно удален: " + configName, false);
+
+        // Обновляем комбобокс
+        updateConfigList();
+
+        // Сбрасываем на дефолтный пункт "Выберите конфиг..."
+        ui->configComboBox->setCurrentIndex(0);
     }
 }
 
@@ -1006,10 +1131,10 @@ void MainWindow::updateInterfaceIcons()
         return QIcon(pixmap);
     };
 
-    // Перекрашиваем каждую кнопку из твоего .ui файла[cite: 2]
+    // Перекрашиваем каждую кнопку из твоего .ui файла
     ui->openFolderButton->setIcon(getTintedIcon(":/res/folder_configs_google.svg"));
-        ui->browseXlsxButton->setIcon(getTintedIcon(":/res/file_export_google.svg"));
-        ui->openXlsxFolderButton->setIcon(getTintedIcon(":/res/folder_open_google.svg"));
-        ui->refreshXlsxButton->setIcon(getTintedIcon(":/res/refresh_google.svg"));
-        ui->settingsButton->setIcon(getTintedIcon(":/res/settings_google.svg"));
+    ui->browseXlsxButton->setIcon(getTintedIcon(":/res/file_export_google.svg"));
+    ui->openXlsxFolderButton->setIcon(getTintedIcon(":/res/folder_open_google.svg"));
+    ui->refreshXlsxButton->setIcon(getTintedIcon(":/res/refresh_google.svg"));
+    ui->settingsButton->setIcon(getTintedIcon(":/res/settings_google.svg"));
 }

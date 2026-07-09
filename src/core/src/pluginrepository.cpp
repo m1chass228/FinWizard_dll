@@ -15,7 +15,19 @@ PluginRepository::PluginRepository(QSettings &settings) : m_settings(settings) {
 // ----------------- AVAILABLE ID ------------------------------
 
 int PluginRepository::nextAvailableId() const {
-    return m_configs.empty() ? 1 : m_configs.rbegin()->first + 1;
+    // Читаем последний выданный ID из настроек, по дефолту 0
+    int lastId = m_settings.value("plugins/last_used_id", 0).toInt();
+    int nextId = lastId + 1;
+
+    // На всякий случай проверяем, вдруг папка с таким ID физически существует на диске
+    QString base = getCacheBasePath();
+    while (QDir(base + QDir::separator() + QString::number(nextId)).exists()) {
+        nextId++;
+    }
+
+    // Сохраняем новый "счетчик"
+    const_cast<QSettings&>(m_settings).setValue("plugins/last_used_id", nextId);
+    return nextId;
 }
 
 // ----------------- GET CONFIGS --------------------------------

@@ -45,6 +45,7 @@ private slots:
     void onPluginLogReceived(int id, const QString &text);
     void onPluginReadyChanged(int id, bool success);
     void updateInterfaceIcons();
+    void onDeleteConfigClicked();
 
 private:
     PluginManager *m_pluginManager;
@@ -65,4 +66,12 @@ private:
     QVariantMap m_delayedParams;
 
     void onPluginFinished(int id, bool success, const QString &message, const QString &outputPath);
+
+    void initSettingsAndPaths();
+    void setupWidgets();
+    void setupConnections();
+    void setupCoreComponents();
+
+    QString m_configsPath;
+    QString m_inputPath;
 };

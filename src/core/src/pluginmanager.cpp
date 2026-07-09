@@ -34,6 +34,11 @@ QPair<int, QString> PluginManager::addConfigFromZip(const QString &zipPath)
     return m_repository.addConfigFromZip(zipPath);
 }
 
+// В pluginmanager.cpp
+void PluginManager::removeConfig(int id) {
+    m_repository.removeConfig(id);
+}
+
 QVariantMap PluginManager::runConfig(int id, const QVariantMap &params)
 {
     // 1. Спрашиваем у Склада описание плагина

@@ -17,6 +17,7 @@ public:
 
     // --- Основное API ---
     QPair<int, QString> addConfigFromZip(const QString &zipPath);
+    void removeConfig(int id);
     QVariantMap runConfig(int id, const QVariantMap &params);
     void unloadPlugin(int id);
 
