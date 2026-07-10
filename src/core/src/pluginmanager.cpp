@@ -22,16 +22,19 @@ PluginManager::~PluginManager()
     // m_settings сам сохранит данные на диск.
 }
 
-QPair<int, QString> PluginManager::addConfigFromZip(const QString &zipPath)
+QPair<int, QString> PluginManager::addConfigFromArchive(const QString &archivePath)
 {
+    // 1. Проверяем, загружен ли уже плагин с таким путем архива.
+    // Если да — выгружаем его из движка, чтобы освободить дескрипторы файлов перед перезаписью.
     for (int id : m_repository.getAllConfigIds()) {
         const CachedConfig* cfg = m_repository.getConfig(id);
-        if (cfg && cfg->originalZipPath == zipPath) {
-            m_engine.unloadPlugin(id);
+        if (cfg && cfg->originalZipPath == archivePath) {
+            m_engine.unloadPlugin(id); // Выгружаем динамическую либу/скрипт из памяти
             break;
         }
     }
-    return m_repository.addConfigFromZip(zipPath);
+
+    return m_repository.addConfigFromFile(archivePath);
 }
 
 // В pluginmanager.cpp

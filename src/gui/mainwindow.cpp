@@ -1,6 +1,7 @@
 // src/gui/mainwindow.cpp
 #include "mainwindow.h"
 #include "finwizard/pluginmanager.h"
+#include "finwizard/archivemanager.h"
 #include "ui_mainwindow.h"
 
 #include <QMessageBox>
@@ -27,10 +28,6 @@
 #include <QMimeData>
 #include <QUrl>
 
-#include <quazip/quazip.h>
-#include <quazip/quazipfile.h>
-#include <quazip/JlCompress.h>
-
 MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
     : QMainWindow(parent)
     , m_pluginManager(pluginManager)
@@ -40,7 +37,7 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
 
     setAcceptDrops(true);
 
-    setWindowTitle("FinWizard dll v1.0.0");
+    setWindowTitle("FinWizard dll v1.2.0");
     setWindowIcon(QIcon(":/res/icon.png"));
 
     if (!m_pluginManager) {
@@ -258,34 +255,37 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
         return;
     }
 
-    QPoint pos = event->pos();
+    QPoint pos = event->position().toPoint();
     QString filePath = event->mimeData()->urls().first().toLocalFile();
+    QFileInfo fi(filePath);
+    QString ext = fi.suffix().toLower();
+    QString compExt = fi.completeSuffix().toLower();
 
-    // Проверяем, над каким виджетом сейчас находится курсор
-    // Проверяем зону Конфигов (например, комбобокс)
+    bool isValidPluginArchive = (ext == "zip" || ext == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz"));
+    bool isValidExcelFile = (ext == "xlsx" || ext == "xls");
+
+    // Зона плагинов принимает ТОЛЬКО валидные архивы
     if (ui->configComboBox->geometry().contains(pos)) {
-        if (filePath.endsWith(".zip", Qt::CaseInsensitive)) {
-            // Подсвечиваем комбобокс приятной зеленой неоновой рамкой
+        if (isValidPluginArchive) {
             ui->configComboBox->setStyleSheet("border: 2px solid #2ecc71; background-color: #1e272e;");
-            ui->xlsxList->setStyleSheet(""); // Гасим соседа
+            ui->xlsxList->setStyleSheet("");
             event->acceptProposedAction();
             return;
         }
     }
-    // Проверяем зону XLSX списка
+    // Зона XLSX принимает эксельки ИЛИ архивы, из которых мы их вытащим
     else if (ui->xlsxList->geometry().contains(pos)) {
-        if (filePath.endsWith(".xlsx", Qt::CaseInsensitive)) {
-            // Подсвечиваем список XLSX красивым синим/голубым цветом
+        if (isValidExcelFile || isValidPluginArchive) {
             ui->xlsxList->setStyleSheet("border: 2px solid #3498db; background-color: #1e272e;");
-            ui->configComboBox->setStyleSheet(""); // Гасим соседа
+            ui->configComboBox->setStyleSheet("");
             event->acceptProposedAction();
             return;
         }
     }
 
-    // Если курсор шляется просто по окну или тип файла не подходит под зону
+    // Если файл не подходит — тушим рамки и шлем его лесом
     clearHoverStyles();
-    event->acceptProposedAction();
+    event->ignore(); // Юзер увидит значок запрета на дроп
 }
 
 // 3. Юзер увёл мышь из окна, так и не сбросив файл
@@ -298,108 +298,134 @@ void MainWindow::dragLeaveEvent(QDragLeaveEvent *event)
 // 4. Юзер отпустил кнопку мыши (ДРОП)
 void MainWindow::dropEvent(QDropEvent *event)
 {
-    clearHoverStyles(); // Сразу гасим неоновые рамки
+    clearHoverStyles(); // Гасим рамки подсветки
 
-    if (event->mimeData()->hasUrls() && !event->mimeData()->urls().isEmpty()) {
-        QPoint pos = event->pos();
-        QList<QUrl> urls = event->mimeData()->urls();
+    if (!event->mimeData()->hasUrls() || event->mimeData()->urls().isEmpty()) {
+        event->ignore();
+        return;
+    }
 
-        // 1. СБРОСИЛИ ZIP В ЗОНУ ПЛАГИНОВ (Берем только первый файл, т.к. плагины ставятся по одному)
-        if (ui->configComboBox->geometry().contains(pos)) {
-            QString filePath = urls.first().toLocalFile();
-            if (filePath.endsWith(".zip", Qt::CaseInsensitive)) {
+    QPoint pos = event->position().toPoint();
+    QList<QUrl> urls = event->mimeData()->urls();
+    QString filePath = urls.first().toLocalFile();
+    QFileInfo fi(filePath);
+    QString ext = fi.suffix().toLower();
+    QString compExt = fi.completeSuffix().toLower(); // Для .tar.gz
 
-                QPair<int, QString> result = m_pluginManager->addConfigFromZip(filePath);
-                int newId = result.first;
-                QString errorMsg = result.second;
+    // Флаг: является ли файл поддерживаемым типом архива
+    bool isArchive = (ext == "zip" || ext == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz"));
 
-                if (newId != -1) {
-                    logMessage("Плагин успешно добавлен! ID: " + QString::number(newId), false);
-                    updateConfigList();
-
-                    int newIndex = ui->configComboBox->findData(newId);
-                    if (newIndex != -1) ui->configComboBox->setCurrentIndex(newIndex);
-                } else {
-                    logMessage("Ошибка добавления плагина: " + errorMsg, true);
-                    QMessageBox::critical(this, "Ошибка добавления плагина", errorMsg);
-                    ui->configComboBox->setCurrentIndex(0);
-                }
-
-                event->acceptProposedAction();
-                return;
-            }
-        }
-
-        // 2. СБРОСИЛИ ФАЙЛЫ В ЗОНУ XLSX ТАБЛИЦ
-        if (ui->xlsxList->geometry().contains(pos)) {
-            QSettings settings("FinWizard", "Settings");
-            QString inputFolder = settings.value("inputFolder",
-                                                 QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input").toString();
-
-            QDir inputDir(inputFolder);
-            if (!inputDir.exists() && !inputDir.mkpath(".")) {
-                event->ignore();
-                return;
-            }
-
-            bool atLeastOneProcessed = false;
-
-            // Крутимся в цикле, так как юзер мог перетащить сразу пачку файлов
-            for (const QUrl &url : urls) {
-                QString filePath = url.toLocalFile();
-                QFileInfo fi(filePath);
-                QString ext = fi.suffix().toLower();
-
-                // Если это обычная экселька
-                if (ext == "xlsx" || ext == "xls") {
-                    QString dest = inputFolder + "/" + fi.fileName();
-                    if (QFile::copy(filePath, dest)) {
-                        logMessage("Скопирован через Drag-and-Drop: " + fi.fileName(), false);
-                        atLeastOneProcessed = true;
-                    } else {
-                        logMessage("Ошибка копирования: " + fi.fileName(), true);
-                    }
-                }
-                // Если закинули ZIP-архив с таблицами
-                // Внутри dropEvent, в секции else if (ext == "zip")
-                else if (ext == "zip") {
-                    QTemporaryDir tempDir;
-                    if (tempDir.isValid()) {
-                        JlCompress::extractDir(filePath, tempDir.path());
-
-                        // Ищем рекурсивно во всех подпапках архива
-                        QDirIterator it(tempDir.path(), {"*.xlsx", "*.xls"}, QDir::Files, QDirIterator::Subdirectories);
-                        while (it.hasNext()) {
-                            QString extractedFilePath = it.next();
-
-                            // Игнорируем метаданные macOS
-                            if (extractedFilePath.contains("__MACOSX")) continue;
-
-                            QFileInfo extFi(extractedFilePath);
-                            QString dest = inputFolder + "/" + extFi.fileName();
-
-                            if (QFile::exists(dest)) {
-                                QFile::remove(dest); // Перезаписываем старый, если есть
-                            }
-
-                            if (QFile::copy(extractedFilePath, dest)) {
-                                logMessage("Скопирован из ZIP через Drag-and-Drop: " + extFi.fileName(), false);
-                                atLeastOneProcessed = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Если хоть один файл успешно скопировался — обновляем наш QListWidget
-            if (atLeastOneProcessed) {
-                updateXlsxList();
-            }
-
-            event->acceptProposedAction();
+    // ========================================================================
+    // ЗОНА ПЛАГИНОВ (configComboBox)
+    // ========================================================================
+    if (ui->configComboBox->geometry().contains(pos)) {
+        if (!isArchive) {
+            logMessage("Ошибка: В зону плагинов можно сбрасывать только архивы (ZIP, TAR, TAR.GZ)!", true);
+            QMessageBox::critical(this, "Неверный формат", "Сюда можно сбрасывать только файлы плагинов в формате архивов (.zip, .tar, .tar.gz)!");
+            event->ignore();
             return;
         }
+
+        // Вызываем обновленный метод менеджера плагинов
+        QPair<int, QString> result = m_pluginManager->addConfigFromArchive(filePath);
+        int newId = result.first;
+        QString errorMsg = result.second;
+
+        if (newId != -1) {
+            logMessage("Плагин успешно добавлен! ID: " + QString::number(newId), false);
+            updateConfigList();
+
+            int newIndex = ui->configComboBox->findData(newId);
+            if (newIndex != -1) ui->configComboBox->setCurrentIndex(newIndex);
+        } else {
+            logMessage("Ошибка добавления плагина: " + errorMsg, true);
+            QMessageBox::critical(this, "Ошибка добавления плагина", errorMsg);
+            ui->configComboBox->setCurrentIndex(0);
+        }
+
+        event->acceptProposedAction();
+        return;
     }
+
+    // ========================================================================
+    // ЗОНА XLSX ТАБЛИЦ (xlsxList)
+    // ========================================================================
+    if (ui->xlsxList->geometry().contains(pos)) {
+        QSettings settings("FinWizard", "Settings");
+        QString inputFolder = settings.value("inputFolder",
+                                             QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input").toString();
+
+        QDir inputDir(inputFolder);
+        if (!inputDir.exists() && !inputDir.mkpath(".")) {
+            event->ignore();
+            return;
+        }
+
+        bool atLeastOneProcessed = false;
+
+        for (const QUrl &url : urls) {
+            QString curPath = url.toLocalFile();
+            QFileInfo curFi(curPath);
+            QString curExt = curFi.suffix().toLower();
+            QString curCompExt = curFi.completeSuffix().toLower();
+
+            // Если кинули чистый Excel
+            if (curExt == "xlsx" || curExt == "xls") {
+                QString dest = inputFolder + "/" + curFi.fileName();
+                if (QFile::copy(curPath, dest)) {
+                    logMessage("Скопирован: " + curFi.fileName(), false);
+                    atLeastOneProcessed = true;
+                } else {
+                    logMessage("Ошибка копирования: " + curFi.fileName(), true);
+                }
+            }
+            // Если кинули архив с таблицами (ZIP или TAR)
+            else if (curExt == "zip" || curExt == "tar" || curCompExt.endsWith("tar.gz") || curCompExt.endsWith("tgz")) {
+                QTemporaryDir tempDir;
+                if (!tempDir.isValid()) continue;
+
+                // Юзаем наш ArchiveManager! Он атомарен и проверит целостность перед распаковкой
+                if (!ArchiveManager::extractArchive(curPath, tempDir.path())) {
+                    logMessage(QString("Ошибка: Архив %1 поврежден или пуст!").arg(curFi.fileName()), true);
+                    QMessageBox::critical(this, "Ошибка архива", QString("Не удалось извлечь архив %1. Он поврежден.").arg(curFi.fileName()));
+                    continue;
+                }
+
+                // Вытаскиваем эксельки из временной папки
+                QDirIterator it(tempDir.path(), {"*.xlsx", "*.xls"}, QDir::Files, QDirIterator::Subdirectories);
+                while (it.hasNext()) {
+                    QString extractedFilePath = it.next();
+                    if (extractedFilePath.contains("__MACOSX")) continue; // Игнорим мусор macOS
+
+                    QFileInfo extFi(extractedFilePath);
+                    QString dest = inputFolder + "/" + extFi.fileName();
+
+                    if (QFile::exists(dest)) {
+                        QFile::remove(dest);
+                    }
+
+                    if (QFile::copy(extractedFilePath, dest)) {
+                        logMessage("Извлечено из архива: " + extFi.fileName(), false);
+                        atLeastOneProcessed = true;
+                    }
+                }
+            }
+            // Если закинули левый файл (картинку, музыку, софт)
+            else {
+                logMessage(QString("Файл отклонен (не таблица/архив): %1").arg(curFi.fileName()), true);
+                QMessageBox::warning(this, "Неподдерживаемый файл",
+                                     QString("Файл %1 не является таблицей Excel или поддерживаемым архивом!").arg(curFi.fileName()));
+            }
+        }
+
+        if (atLeastOneProcessed) {
+            updateXlsxList();
+        }
+
+        event->acceptProposedAction();
+        return;
+    }
+
     event->ignore();
 }
 
@@ -628,50 +654,59 @@ void MainWindow::onBrowseXlsxClicked()
     QDir inputDir(inputFolder);
     if (!inputDir.exists() && !inputDir.mkpath(".")) return;
 
+    // 1. Расширяем строку фильтра файлов для диалогового окна
     QStringList selectedFiles = QFileDialog::getOpenFileNames(
-        this, "Выберите XLSX-файлы или ZIP-архивы",
+        this, "Выберите XLSX-файлы или Архивы таблиц",
         settings.value("lastInputFolder").toString(),
-        "Поддерживаемые файлы (*.xlsx *.xls *.zip)"
+        "Поддерживаемые файлы (*.xlsx *.xls *.zip *.tar *.tar.gz *.tgz)"
         );
 
     if (selectedFiles.isEmpty()) return;
 
     settings.setValue("lastInputFolder", QFileInfo(selectedFiles.first()).absolutePath());
 
+    bool atLeastOneProcessed = false;
+
     for (const QString &filePath : selectedFiles) {
         QFileInfo fi(filePath);
         QString ext = fi.suffix().toLower();
+        QString compExt = fi.completeSuffix().toLower(); // Для отлова комбо-вариантов (.tar.gz)
 
+        // А) Если это обычная одиночная таблица Excel
         if (ext == "xlsx" || ext == "xls") {
             QString dest = inputFolder + "/" + fi.fileName();
 
-            // Если файл уже есть — удаляем его, чтобы QFile::copy не подавился
             if (QFile::exists(dest)) {
                 QFile::remove(dest);
             }
 
             if (QFile::copy(filePath, dest)) {
                 logMessage("Скопирован: " + fi.fileName(), false);
+                atLeastOneProcessed = true;
             } else {
                 logMessage("Ошибка копирования (проверьте доступ): " + fi.fileName(), true);
             }
         }
-        else if (ext == "zip") {
+        // Б) Универсальная обработка ЛЮБЫХ архивов (ZIP, TAR, TAR.GZ, TGZ)
+        else if (ext == "zip" || ext == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz")) {
             QTemporaryDir tempDir;
             if (!tempDir.isValid()) continue;
 
-            // Распаковываем
-            JlCompress::extractDir(filePath, tempDir.path());
+            // Наш атомарный ArchiveManager делает сухую валидацию, а потом распаковывает
+            if (!ArchiveManager::extractArchive(filePath, tempDir.path())) {
+                logMessage(QString("Ошибка: Архив %1 поврежден, пуст или не поддерживается!").arg(fi.fileName()), true);
+                QMessageBox::critical(this, "Ошибка архива", QString("Не удалось извлечь архив %1. Он поврежден.").arg(fi.fileName()));
+                continue;
+            }
 
-            // Используем итератор, чтобы найти эксельки, даже если они внутри папок в архиве
+            // Ищем эксельки рекурсивно внутри временной папки
             QDirIterator it(tempDir.path(), {"*.xlsx", "*.xls"}, QDir::Files, QDirIterator::Subdirectories);
             while (it.hasNext()) {
                 QString extractedFilePath = it.next();
+
+                if (extractedFilePath.contains("__MACOSX")) continue; // Игнорируем мусор от macOS
+
                 QFileInfo extFi(extractedFilePath);
-
-                // Пропускаем мусорные файлы macOS, если они есть
-                if (extractedFilePath.contains("__MACOSX")) continue;
-
                 QString dest = inputFolder + "/" + extFi.fileName();
 
                 if (QFile::exists(dest)) {
@@ -679,12 +714,16 @@ void MainWindow::onBrowseXlsxClicked()
                 }
 
                 if (QFile::copy(extractedFilePath, dest)) {
-                    logMessage("Скопирован из ZIP: " + extFi.fileName(), false);
+                    logMessage("Извлечено из архива: " + extFi.fileName(), false);
+                    atLeastOneProcessed = true;
                 }
             }
         }
     }
-    updateXlsxList();
+
+    if (atLeastOneProcessed) {
+        updateXlsxList();
+    }
 }
 
 void MainWindow::onSettingsClicked()
@@ -939,30 +978,27 @@ void MainWindow::updateConfigPreview(int configId)
 
 void MainWindow::onAddConfigClicked()
 {
-    QString zipPath = QFileDialog::getOpenFileName(this, "Выберите ZIP-файл",
-                                                   QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
-                                                   "ZIP (*.zip)");
-    if (zipPath.isEmpty()) return;
+    // Расширяем фильтр диалогового окна на все наши форматы
+    QString archivePath = QFileDialog::getOpenFileName(this, "Выберите архив плагина",
+                                                       QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+                                                       "Архивы плагинов (*.zip *.tar *.tar.gz *.tgz)");
+    if (archivePath.isEmpty()) return;
 
-    // Менеджер возвращает пару: ID и текст ошибки
-    QPair<int, QString> result = m_pluginManager->addConfigFromZip(zipPath);
+    // Переключаем на метод addConfigFromArchive
+    QPair<int, QString> result = m_pluginManager->addConfigFromArchive(archivePath);
 
     int newId = result.first;
     QString errorMsg = result.second;
 
     if (newId != -1) {
-        // Успех!
         logMessage("Плагин успешно добавлен! ID: " + QString::number(newId), false);
         updateConfigList();
 
         int newIndex = ui->configComboBox->findData(newId);
         if (newIndex != -1) ui->configComboBox->setCurrentIndex(newIndex);
     } else {
-        // Провал! Показываем красивое окно с причиной
         logMessage("Ошибка добавления плагина: " + errorMsg, true);
         QMessageBox::critical(this, "Ошибка добавления плагина", errorMsg);
-
-        // Сбрасываем комбобокс на "Выберите..."
         ui->configComboBox->setCurrentIndex(0);
     }
 }

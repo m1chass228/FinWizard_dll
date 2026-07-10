@@ -1,6 +1,10 @@
 # src/core/CMakeLists.txt
 
-add_library(core STATIC)   # или SHARED, если хочешь dll/so
+add_library(core STATIC
+    include/finwizard/archivemanager.h
+    src/archivemanager.cpp
+
+)   # или SHARED, если хочешь dll/so
 
 # Все исходники и заголовки
 target_sources(core
@@ -29,6 +33,8 @@ target_link_libraries(core
     PUBLIC
         Qt6::Core
         QuaZip::QuaZip   # если у тебя QuaZip::QuaZip6 — замени
+    PRIVATE
+        microtar
 )
 
 # Если соберёшь как SHARED — добавь экспорт символов

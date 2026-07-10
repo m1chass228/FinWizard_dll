@@ -16,7 +16,7 @@ public:
     ~PluginManager() override;
 
     // --- Основное API ---
-    QPair<int, QString> addConfigFromZip(const QString &zipPath);
+    QPair<int, QString> addConfigFromArchive(const QString &archivePath);
     void removeConfig(int id);
     QVariantMap runConfig(int id, const QVariantMap &params);
     void unloadPlugin(int id);

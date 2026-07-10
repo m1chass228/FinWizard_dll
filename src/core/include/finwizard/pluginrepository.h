@@ -27,7 +27,7 @@ class PluginRepository
 public:
     explicit PluginRepository(QSettings &settings);
 
-    QPair<int, QString> addConfigFromZip(const QString &zipPath);
+    QPair<int, QString> addConfigFromFile(const QString &filePath);
     void refreshPlugins();
     void removeConfig(int id);
 
@@ -41,11 +41,17 @@ public:
 private:
     int nextAvailableId() const;
     QString createCacheDirForId(int id);
-    bool extractZip(const QString &zipPath, const QString &targetDir);
+    bool extractArchive(const QString &archivePath, const QString &targetDir);
     CachedConfig parseManifest(const QString &dirPath) const;
 
     std::map<int, CachedConfig> m_configs;
     QSettings &m_settings;
+
+    std::vector<char> decompressGzip(const std::string& gzFilePath);
+
+    bool extractTarFromBuffer(const std::vector<char>& tarBuffer, const QString& destDir);
+
+    bool extractPureTar(const QString& tarFilePath, const QString& destDir);
 };
 
 #endif // PLUGINREPOSITORY_H

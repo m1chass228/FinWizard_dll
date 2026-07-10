@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(FinWizard VERSION 0.1 LANGUAGES CXX)
+project(FinWizard VERSION 0.1 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,11 +31,22 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/quazip-master)
 set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 
+# ====================== microtar ======================
+add_library(microtar STATIC
+    thirdparty/microtar/src/microtar.c
+    thirdparty/microtar/src/microtar.h
+)
+# Это оставляем для порядка
+target_include_directories(microtar PUBLIC thirdparty/microtar/src)
+
 # ====================== Наши модули ======================
 add_subdirectory(src/core)
 add_subdirectory(src/gui)
 
-include_directories(src/core/include)
+include_directories(
+    src/core/include
+    thirdparty/microtar/src
+)
 
 if(WIN32)
     if(TARGET FinWizardGui)

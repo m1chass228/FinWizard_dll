@@ -1,4 +1,4 @@
-            #include "finwizard/pluginrepository.h"
+#include "finwizard/pluginrepository.h"
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -6,9 +6,12 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDebug>
+#include <fstream>
 
 #include <quazip/quazip.h>
 #include <quazip/quazipfile.h>
+
+#include "finwizard/archivemanager.h"
 
 PluginRepository::PluginRepository(QSettings &settings) : m_settings(settings) {}
 
@@ -47,16 +50,18 @@ QList<int> PluginRepository::getAllConfigIds() const {
 
 // ----------------- ADD CONFIG (ZIP)----------------------------
 
-QPair<int, QString> PluginRepository::addConfigFromZip(const QString &zipPath)
+QPair<int, QString> PluginRepository::addConfigFromFile(const QString &filePath)
 {
-    if (!QFile::exists(zipPath)) {
-        return {-1, "Файл ZIP не существует или недоступен для чтения."};
+    if (!QFile::exists(filePath)) {
+        return {-1, "Файл не существует или недоступен для чтения."};
     }
 
-    QFileInfo fi(zipPath);
+    QFileInfo fi(filePath);
+
+    // 1. Проверяем, не добавляли ли мы этот файл ранее
     int existingId = -1;
     for (const auto &[id, cfg] : m_configs) {
-        if (cfg.originalZipPath == zipPath) {
+        if (cfg.originalZipPath == filePath) {
             existingId = id;
             break;
         }
@@ -66,69 +71,42 @@ QPair<int, QString> PluginRepository::addConfigFromZip(const QString &zipPath)
         const auto &old = m_configs[existingId];
         if (fi.lastModified() <= old.lastExtracted) {
             m_configs[existingId].lastUsed = QDateTime::currentDateTime();
-            return {existingId, ""}; // Успех, вернули старый
+            return {existingId, ""};
         }
         QDir(old.cachePath).removeRecursively();
         m_configs.erase(existingId);
     }
 
+    // 2. Выделяем ID и создаем директорию кэша
     int id = (existingId != -1) ? existingId : nextAvailableId();
     QString cacheDir = createCacheDirForId(id);
 
     if (cacheDir.isEmpty()) {
-        return {-1, "Не удалось создать папку кэша: " + cacheDir};
+        return {-1, "Не удалось создать папку кэша."};
     }
 
-    if (!extractZip(zipPath, cacheDir)) {
+    // 3. УНИВЕРСАЛЬНАЯ РАСПАКОВКА ЧЕРЕЗ ARCHIVEMANAGER
+    if (!ArchiveManager::extractArchive(filePath, cacheDir)) {
         QDir(cacheDir).removeRecursively();
-        return {-1, "Не удалось распаковать ZIP-архив. Возможно, файл поврежден."};
+        return {-1, "Не удалось открыть или распаковать архив. Возможно, файл поврежден или не поддерживается."};
     }
 
+    // 4. ВАЛИДАЦИЯ МАНИФЕСТА
     CachedConfig cfg = parseManifest(cacheDir);
     if (!cfg.isValid) {
         QDir(cacheDir).removeRecursively();
         return {-1, "Ошибка в манифесте плагина:\n" + cfg.validationMessage};
     }
 
+    // 5. Сохраняем валидный конфиг в память
     cfg.id = id;
-    cfg.originalZipPath = zipPath;
+    cfg.originalZipPath = filePath;
     cfg.lastExtracted = QDateTime::currentDateTime();
     cfg.lastUsed = cfg.lastExtracted;
     if (cfg.displayName.isEmpty()) cfg.displayName = fi.baseName();
 
     m_configs[id] = std::move(cfg);
-    return {id, ""}; // Успех! Ошибок нет.
-}
-
-bool PluginRepository::extractZip(const QString &zipPath, const QString &targetDir)
-{
-    QuaZip zip(zipPath);
-    if (!zip.open(QuaZip::mdUnzip)) {
-        qWarning() << "ZIP open error:" << zip.getZipError();
-        return false;
-    }
-
-    QDir dir(targetDir);
-    if (!dir.mkpath(".")) return false;
-
-    for (bool more = zip.goToFirstFile(); more; more = zip.goToNextFile()) {
-        QString name = zip.getCurrentFileName();
-        if (name.endsWith('/')) continue;
-
-        QString outPath = targetDir + QDir::separator() + name;
-        QDir().mkpath(QFileInfo(outPath).absolutePath());
-
-        QuaZipFile zf(&zip);
-        if (!zf.open(QIODevice::ReadOnly)) continue;
-
-        QFile out(outPath);
-        if (!out.open(QIODevice::WriteOnly)) continue;
-
-        out.write(zf.readAll());
-        out.close();
-    }
-    zip.close();
-    return true;
+    return {id, ""};
 }
 
 // ----------------- REMOVE CONFIG  -------------------------------
