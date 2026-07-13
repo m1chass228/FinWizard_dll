@@ -110,6 +110,10 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
 
     // 1. Создаем venv синхронно
     if (!QFile::exists(nativeVenvPython)) {
+        QDir oldVenv(venvPath);
+        if (oldVenv.exists()) {
+            oldVenv.removeRecursively();
+        }
         QProcess createVenv;
 #ifdef Q_OS_WIN
         QProcessEnvironment venvEnv = QProcessEnvironment::systemEnvironment();
@@ -142,9 +146,8 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
     QProcess* proc = m_pipProcess; // Локальная копия для безопасного использования в лямбдах
 
 #ifdef Q_OS_WIN
-    proc->setReadChannelEncoding(QProcess::OutputChannel::StandardOutput, QStringConverter::Utf8);
-    proc->setReadChannelEncoding(QProcess::OutputChannel::StandardError, QStringConverter::Utf8);
-
+    // Нам не нужны setReadChannelEncoding, Qt 6 по умолчанию
+    // умеет работать с окружением, а байты мы прочитаем как надо.
     QProcessEnvironment pipEnv = QProcessEnvironment::systemEnvironment();
     pipEnv.insert("PYTHONIOENCODING", "utf-8");
     pipEnv.insert("PYTHONUTF8", "1");
@@ -520,7 +523,11 @@ QVariantMap PluginEngine::runExternalProcess(const CachedConfig &cfg, const QVar
 }
 QString PluginEngine::getPythonExecutable(const CachedConfig &cfg) const
 {
-    // 1. В первую очередь проверяем наличие локального venv для плагина
+    // Безопасный каст для вызова сигналов из const-метода
+    PluginEngine* mutableThis = const_cast<PluginEngine*>(this);
+
+    mutableThis->infoLogRequested("=== [PYTHON SEARCH] Начинаю поиск интерпретатора ===");
+
     QString venvPython;
 #ifdef Q_OS_WIN
     venvPython = cfg.cachePath + "/.venv/Scripts/python.exe";
@@ -528,51 +535,60 @@ QString PluginEngine::getPythonExecutable(const CachedConfig &cfg) const
     venvPython = cfg.cachePath + "/.venv/bin/python";
 #endif
 
+    mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 1: Проверка venv плагина: " + QDir::toNativeSeparators(venvPython));
     if (QFile::exists(venvPython)) {
-        return venvPython; // Если venv уже создан и существует — работаем через него
+        mutableThis->infoLogRequested("--> Найдено локальное окружение venv плагина.");
+        return QDir::toNativeSeparators(venvPython);
     }
 
-    // 2. Откат: Ищем БАЗОВЫЙ портативный Python, который установил Inno Setup
     QString appDir = QCoreApplication::applicationDirPath();
     QString basePython;
 
 #if defined(Q_OS_WIN)
-    // Строго папка "python" рядом с нашим .exe в Program Files
     basePython = QDir(appDir).absoluteFilePath("python/python.exe");
+    mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 2 (Win): Проверка портативного пути {app}/python/python.exe: " + QDir::toNativeSeparators(basePython));
 
-    // ХАК ДЛЯ РАЗРАБОТКИ (если запускаешь из Qt Creator, чтобы тоже работало):
     if (!QFile::exists(basePython)) {
         basePython = QDir(appDir).absoluteFilePath("../../installer/win_python/python.exe");
+        mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 2a (Dev-откат 1): Проверка пути разработки: " + QDir::toNativeSeparators(basePython));
     }
     if (!QFile::exists(basePython)) {
         basePython = QDir(appDir).absoluteFilePath("../../../installer/win_python/python.exe");
+        mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 2b (Dev-откат 2): Проверка альтернативного пути разработки: " + QDir::toNativeSeparators(basePython));
     }
 
-    // КРИТИЧЕСКИЙ СЛУЧАЙ: Если портативного питона вообще нигде нет,
-    // пробуем найти системный, но ТОЛЬКО через официальный PATH (без жестких путей к AppData)
     if (!QFile::exists(basePython)) {
+        mutableThis->infoLogRequested("[PYTHON SEARCH] Предупреждение: Портативный Python не обнаружен. Ищу в системном PATH...");
         basePython = QStandardPaths::findExecutable("python");
+        mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 3 (Win): Поиск в системном PATH: " + QDir::toNativeSeparators(basePython));
+
         if (basePython.isEmpty()) {
-            basePython = "python"; // Самый крайний случай
+            basePython = "python";
+            mutableThis->infoLogRequested("[PYTHON SEARCH] Внимание: Системный Python не найден в PATH, возвращаю fallback-имя 'python'");
         }
     }
 #elif defined(Q_OS_MAC)
     basePython = QDir(appDir).absoluteFilePath("../Resources/python/bin/python3");
+    mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 2 (Mac): Проверка ресурсов бандла: " + QDir::toNativeSeparators(basePython));
     if (!QFile::exists(basePython)) {
         basePython = QStandardPaths::findExecutable("python3");
         if (basePython.isEmpty()) basePython = QStandardPaths::findExecutable("python");
+        mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 3 (Mac): Поиск в системном PATH: " + QDir::toNativeSeparators(basePython));
     }
 #else
-    // Linux
     basePython = QDir(appDir).absoluteFilePath("python/bin/python3");
+    mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 2 (Linux): Проверка локального пути: " + QDir::toNativeSeparators(basePython));
     if (!QFile::exists(basePython)) {
         QStringList pythonNames = {"python3", "python"};
         for (const QString &binName : pythonNames) {
             basePython = QStandardPaths::findExecutable(binName);
             if (!basePython.isEmpty()) break;
         }
+        mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 3 (Linux): Поиск в системном PATH: " + QDir::toNativeSeparators(basePython));
     }
 #endif
 
-    return QDir::toNativeSeparators(basePython);
+    QString finalPath = QDir::toNativeSeparators(basePython);
+    mutableThis->infoLogRequested("=== [PYTHON SEARCH] Итоговый выбранный путь: " + finalPath + " ===");
+    return finalPath;
 }

@@ -37,7 +37,7 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
 
     setAcceptDrops(true);
 
-    setWindowTitle("FinWizard dll v1.2.0");
+    setWindowTitle("FinWizard dll v1.2.1");
     setWindowIcon(QIcon(":/res/icon.png"));
 
     if (!m_pluginManager) {
@@ -231,6 +231,9 @@ void MainWindow::setupConnections()
     // --- 5. ПОДПИСКА НА СИГНАЛЫ ДВИЖКА (через менеджер) ---
     connect(m_pluginManager, &PluginManager::pluginLogReceived, this, &MainWindow::onPluginLogReceived);
     connect(m_pluginManager, &PluginManager::pluginReadyChanged, this, &MainWindow::onPluginReadyChanged);
+    connect(m_pluginManager, &PluginManager::infoLogRequested, this, [this](const QString &text) {
+        logMessage(text, false);
+    });
 }
 
 // Вспомогательный метод для очистки стилей

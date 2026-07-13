@@ -47,6 +47,8 @@ signals:
     // Сигнал возврата результатов работы плагина (успех, сообщение, путь к итоговому XLSX)
     void pluginFinished(int id, bool success, const QString &message, const QString &outputPath);
 
+    void infoLogRequested(const QString &text);
+
 private:
     QSettings m_settings;
     PluginRepository m_repository;

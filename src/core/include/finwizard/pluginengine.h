@@ -34,6 +34,7 @@ signals:
     void pipLogReady(int id, const QString &text);
     void pipFinished(int id, bool success);
     void pluginFinished(int id, bool success, const QString &message, const QString &outputPath);
+    void infoLogRequested(const QString &text);
 
 private:
     bool prepareDependencies(const QString &cacheDir);

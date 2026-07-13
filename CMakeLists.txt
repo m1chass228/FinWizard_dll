@@ -66,5 +66,17 @@ if(WIN32)
     endif()
 endif()
 
+if(WINDOWS)
+    set_target_properties(FinWizardGui PROPERTIES WIN32_EXECUTABLE TRUE)
+
+    # Автоматический запуск windeployqt при CMake Install
+    qt_generate_deploy_app_script(
+        TARGET FinWizardGui
+        OUTPUT_SCRIPT deploy_script
+    )
+    install(TARGETS FinWizardGui RUNTIME DESTINATION bin)
+    install(SCRIPT ${deploy_script})
+endif()
+
 message(STATUS "Build system: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "CMake configuration completed successfully")

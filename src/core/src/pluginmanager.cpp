@@ -13,6 +13,7 @@ PluginManager::PluginManager(QObject *parent)
     connect(&m_engine, &PluginEngine::pipLogReady, this, &PluginManager::pluginLogReceived, Qt::UniqueConnection);
     connect(&m_engine, &PluginEngine::pipFinished, this, &PluginManager::pluginReadyChanged, Qt::UniqueConnection);
     connect(&m_engine, &PluginEngine::pluginFinished, this, &PluginManager::pluginFinished, Qt::UniqueConnection);
+    connect(&m_engine, &PluginEngine::infoLogRequested, this, &PluginManager::infoLogRequested);
 }
 
 PluginManager::~PluginManager()
