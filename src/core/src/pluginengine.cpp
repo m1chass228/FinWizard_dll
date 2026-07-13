@@ -11,25 +11,19 @@
 #include <QJsonArray>
 
 PluginEngine::PluginEngine(QObject *parent)
-    : QObject(parent), m_pipProcess(nullptr)
+    : QObject(parent), m_pipProcess(nullptr), m_isWaitingForPip(false)
 {
 }
 
 PluginEngine::~PluginEngine()
 {
-    // Если процесс pip еще выполняется в момент уничтожения движка
     if (m_pipProcess) {
-        // Отключаем все сигналы, чтобы лямбды не вызвались во время уничтожения объекта
         m_pipProcess->disconnect();
-
-        if (m_pipProcess->state() != QProcess::NotRunning) {
-            m_pipProcess->kill(); // Принудительно тушим процесс
-            m_pipProcess->waitForFinished(1000); // Даем 1 секунду на очистку в ОС
-        }
-
-        delete m_pipProcess; // Чистим память вручную, так как деструктор — это финал
+        m_pipProcess->kill();
+        delete m_pipProcess;
         m_pipProcess = nullptr;
     }
+    m_isWaitingForPip = false;
 }
 
 // ------------------ PREPARE DEPENCIES ----------------------
@@ -72,8 +66,7 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
         QFile manifestFile(cfg.cachePath + "/manifest.json");
         if (manifestFile.open(QIODevice::ReadOnly)) {
             QJsonObject obj = QJsonDocument::fromJson(manifestFile.readAll()).object();
-            manifestFile.close(); // Сразу закрываем чтение
-
+            manifestFile.close();
             QJsonArray depsArray = obj.value("dependencies").toArray();
             if (!depsArray.isEmpty()) {
                 QFile reqFile(reqPath);
@@ -86,75 +79,116 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
                     qInfo() << "Requirements.txt успешно сгенерирован автоматически.";
                 }
             } else {
-                return true; // Зависимостей нет — выходим
+                return true;
             }
         }
     }
 
     QString venvPath = cfg.cachePath + "/.venv";
     QString venvPython;
-
 #ifdef Q_OS_WIN
     venvPython = venvPath + "/Scripts/python.exe";
 #else
     venvPython = venvPath + "/bin/python";
 #endif
 
-    // Если маркер уже стоит и venv на месте — всё готово, выходим сразу
     QString installedMarker = venvPath + "/.requirements_installed";
     if (QFile::exists(venvPython) && QFile::exists(installedMarker)) {
         return true;
     }
 
     QString basePython = getPythonExecutable(cfg);
-
-    // Проверяем, нашли ли хоть какой-то Python
     if (basePython.isEmpty() || (!basePython.contains("python") && !QFile::exists(basePython))) {
         qWarning() << "Критическая ошибка: Базовый Python интерпретатор не найден!";
         return false;
     }
 
-    // 1. Создаем venv (тут пока оставим синхронно, так как это быстро — 1-2 сек)
-    if (!QFile::exists(venvPython)) {
+    QString nativeVenvPython = QDir::toNativeSeparators(venvPython);
+    QString nativeReqPath = QDir::toNativeSeparators(reqPath);
+    QString nativeVenvPath = QDir::toNativeSeparators(venvPath);
+    QString nativeBasePython = QDir::toNativeSeparators(basePython);
+
+    // 1. Создаем venv синхронно
+    if (!QFile::exists(nativeVenvPython)) {
         QProcess createVenv;
-        createVenv.start(basePython, QStringList() << "-m" << "venv" << venvPath);
+#ifdef Q_OS_WIN
+        QProcessEnvironment venvEnv = QProcessEnvironment::systemEnvironment();
+        venvEnv.insert("PYTHONIOENCODING", "utf-8");
+        venvEnv.insert("PYTHONUTF8", "1");
+        createVenv.setProcessEnvironment(venvEnv);
+#endif
+        createVenv.start(nativeBasePython, QStringList() << "-m" << "venv" << nativeVenvPath);
         if (!createVenv.waitForFinished(30000) || createVenv.exitCode() != 0) {
             qWarning() << "Не удалось создать venv:" << createVenv.readAllStandardError();
             return false;
         }
     }
 
-    // 2. АСИНХРОННЫЙ ЗАПУСК PIP ДЛЯ GUI
-    // Если прошлый процесс еще живой — не запускаем новый
+    // 2. АСИНХРОННЫЙ ЗАПУСК PIP
     if (m_pipProcess && m_pipProcess->state() != QProcess::NotRunning) {
+        qWarning() << "Pip уже запущен для другого процесса, отмена.";
         return false;
     }
 
-    if (!m_pipProcess) {
-        m_pipProcess = new QProcess(); // Создаем процесс, если еще нет
+    if (m_pipProcess) {
+        m_pipProcess->disconnect();
+        m_pipProcess->kill();
+        m_pipProcess->deleteLater();
+        m_pipProcess = nullptr;
     }
 
-    // Настраиваем аргументы для pip
+    // Создаем процесс
+    m_pipProcess = new QProcess(this);
+    QProcess* proc = m_pipProcess; // Локальная копия для безопасного использования в лямбдах
+
+#ifdef Q_OS_WIN
+    proc->setReadChannelEncoding(QProcess::OutputChannel::StandardOutput, QStringConverter::Utf8);
+    proc->setReadChannelEncoding(QProcess::OutputChannel::StandardError, QStringConverter::Utf8);
+
+    QProcessEnvironment pipEnv = QProcessEnvironment::systemEnvironment();
+    pipEnv.insert("PYTHONIOENCODING", "utf-8");
+    pipEnv.insert("PYTHONUTF8", "1");
+    proc->setProcessEnvironment(pipEnv);
+#endif
+
     QStringList pipArgs;
-    pipArgs << "-m" << "pip" << "install" << "-r" << reqPath;
+    pipArgs << "-m" << "pip" << "install" << "-r" << nativeReqPath;
 
-    // ВАЖНО: Одиночные чистые коннекты
-    QObject::connect(m_pipProcess, &QProcess::readyReadStandardOutput, [this, cfg]() {
-        QString output = m_pipProcess->readAllStandardOutput().trimmed();
-        qDebug() << "[PIP OUT]:" << output;
-        emit pipLogReady(cfg.id, output);
+    // --- БЕЗОПАСНЫЕ КОННЕКТЫ (Контекст жизни — сам proc) ---
+
+    QObject::connect(proc, &QProcess::readyReadStandardOutput, proc, [this, proc, cfg]() {
+        // Читаем напрямую из захваченного локального указателя, а не из поля класса
+        QString output = proc->readAllStandardOutput().trimmed();
+        if (!output.isEmpty()) {
+            qDebug() << "[PIP OUT]:" << output;
+            emit pipLogReady(cfg.id, output);
+        }
     });
 
-    QObject::connect(m_pipProcess, &QProcess::readyReadStandardError, [this, cfg]() {
-        QString errorOutput = m_pipProcess->readAllStandardError().trimmed();
-        qWarning() << "[PIP ERR]:" << errorOutput;
-        emit pipLogReady(cfg.id, "[ERROR] " + errorOutput);
+    QObject::connect(proc, &QProcess::readyReadStandardError, proc, [this, proc, cfg]() {
+        QString errorOutput = proc->readAllStandardError().trimmed();
+        if (!errorOutput.isEmpty()) {
+            qWarning() << "[PIP ERR]:" << errorOutput;
+            emit pipLogReady(cfg.id, "[ERROR] " + errorOutput);
+        }
     });
 
-    // Обработка завершения
-    // Обработка завершения в setupPythonEnvironment
-    QObject::connect(m_pipProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-                     [this, cfg, venvPath, installedMarker](int exitCode, QProcess::ExitStatus exitStatus) {
+    QObject::connect(proc, &QProcess::errorOccurred, proc, [this, proc, cfg](QProcess::ProcessError error) {
+        qWarning() << "PIP ошибка процесса:" << error << proc->errorString();
+
+        // Гарантируем, что если это текущий активный процесс движка — сбрасываем флаги
+        if (m_pipProcess == proc) {
+            m_isWaitingForPip = false;
+            m_pipProcess = nullptr;
+        }
+
+        emit pipFinished(cfg.id, false);
+        proc->disconnect();
+        proc->deleteLater();
+    });
+
+    QObject::connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), proc,
+                     [this, proc, cfg, installedMarker](int exitCode, QProcess::ExitStatus exitStatus) {
 
                          bool success = (exitStatus == QProcess::NormalExit && exitCode == 0);
 
@@ -165,44 +199,57 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
                                  marker.close();
                              }
 
-                             // === АВТОСТАРТ ===
                              if (m_isWaitingForPip && m_delayedCfg.id == cfg.id) {
                                  m_isWaitingForPip = false;
                                  qInfo() << "🚀 [ДВИЖОК] Запускаю отложенный Python-скрипт...";
 
-                                 // Запускаем скрипт
-                                 QVariantMap runResult = runExternalProcess(m_delayedCfg, m_delayedParams);
-                                 qDebug() << "Результат автоматического запуска скрипта движком:" << runResult;
+                                 // Чтобы тяжелый runExternalProcess не блокировал калбэк завершения,
+                                 // вызываем его через метасистему (асинхронно в следующем тике таймера)
+                                 QMetaObject::invokeMethod(this, [this, cfg]() {
+                                     QVariantMap runResult = runExternalProcess(m_delayedCfg, m_delayedParams);
+                                     qDebug() << "Результат автоматического запуска скрипта движком:" << runResult;
 
-                                 bool scriptSuccess = runResult.value("success").toBool();
-                                 QString msg = runResult.value("message").toString();
-                                 QString outPath = runResult.value("outputPath").toString();
+                                     bool scriptSuccess = runResult.value("success").toBool();
+                                     QString msg = runResult.value("message").toString();
+                                     QString outPath = runResult.value("outputPath").toString();
+                                     if (!scriptSuccess && msg.isEmpty()) {
+                                         msg = runResult.value("error").toString();
+                                     }
+                                     emit pluginFinished(cfg.id, scriptSuccess, msg, outPath);
+                                 }, Qt::QueuedConnection);
 
-                                 if (!scriptSuccess && msg.isEmpty()) {
-                                     msg = runResult.value("error").toString();
-                                 }
-
-                                 // Оповещаем GUI, что плагин ПОЛНОСТЬЮ отработал
-                                 emit pluginFinished(cfg.id, scriptSuccess, msg, outPath);
                              } else {
-                                 // Если это была просто фоновая установка без ожидания запуска
                                  emit pipFinished(cfg.id, true);
                              }
-
                          } else {
                              qWarning() << "Pip завершился с ошибкой. Код:" << exitCode;
-                             m_isWaitingForPip = false;
+                             if (m_pipProcess == proc) {
+                                 m_isWaitingForPip = false;
+                             }
                              emit pipFinished(cfg.id, false);
                          }
 
-                         m_pipProcess->deleteLater();
-                         m_pipProcess = nullptr;
+                         // Зануляем поле класса, только если этот процесс до сих пор является актуальным
+                         if (m_pipProcess == proc) {
+                             m_pipProcess = nullptr;
+                         }
+                         proc->deleteLater();
                      });
 
     qInfo() << "Запуск асинхронной установки зависимостей для плагина...";
-    m_pipProcess->start(venvPython, pipArgs);
+    proc->start(nativeVenvPython, pipArgs);
 
-    return m_pipProcess->waitForStarted(); // Возвращаем true, если процесс успешно стартовал
+    if (!proc->waitForStarted(5000)) {
+        qWarning() << "Не удалось запустить pip процесс:" << proc->errorString();
+        if (m_pipProcess == proc) {
+            m_pipProcess = nullptr;
+        }
+        proc->disconnect();
+        proc->deleteLater();
+        return false;
+    }
+
+    return true;
 }
 
 // ------------------- LOAD PLUGIN ---------------------------
@@ -233,9 +280,9 @@ bool PluginEngine::loadPlugin(const CachedConfig &cfg)
     // Подготовка окружения для DLL (пути к либам)[cite: 1]
     prepareDependencies(cfg.cachePath); //[cite: 1]
 
-    if (!loader->load()) { //[cite: 1]
+    if (!loader->load()) {
         qWarning() << "Ошибка загрузки плагина:" << loader->errorString(); //[cite: 1]
-        return false; //[cite: 1]
+        return false;
     }
 
     // 6. Получаем объект интерфейса C++
@@ -313,7 +360,20 @@ QVariantMap PluginEngine::runPlugin(const CachedConfig &cfg, const QVariantMap &
                 m_delayedParams = params;
 
                 qInfo() << "Окружение не готово. Запуск инициализации venv для конфига:" << cfg.id;
-                setupPythonEnvironment(cfg);
+
+                if (!setupPythonEnvironment(cfg)) {
+                    // setupPythonEnvironment провалилась СИНХРОННО (нет Python в системе,
+                    // не удалось создать venv, не смог стартовать pip-процесс и т.п.).
+                    // Раньше этот false просто игнорировался: m_isWaitingForPip оставался true
+                    // навсегда, никакой сигнал завершения уже не придет (процесс так и не запустился),
+                    // и UI зависал на "⏳ Установка библиотек..." без единой ошибки пользователю.
+                    m_isWaitingForPip = false;
+
+                    QVariantMap failResult;
+                    failResult["success"] = false;
+                    failResult["error"] = "Не удалось запустить установку зависимостей Python. Проверьте, установлен ли Python в системе.";
+                    return failResult;
+                }
 
                 QVariantMap initResult;
                 initResult["success"] = false;
@@ -342,19 +402,18 @@ QVariantMap PluginEngine::runExternalProcess(const CachedConfig &cfg, const QVar
 {
     QVariantMap result;
 
-    QString inputPath = cfg.cachePath + "/input.json";
-    QString outputPath = cfg.cachePath + "/output.json";
+    QString inputPath = cfg.cachePath + QString("/input_%1.json").arg(cfg.id);
+    QString outputPath = cfg.cachePath + QString("/output_%1.json").arg(cfg.id);
 
     // 1. Создаем input.json (ЯВНО СТАВИМ UTF-8 И ТЕКСТОВЫЙ РЕЖИМ)
     QJsonDocument docIn(QJsonObject::fromVariantMap(params));
     QFile inFile(inputPath);
     if (inFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        // Насильно сохраняем в UTF-8 без BOM, чтобы Python 100% прочитал русские пути
         inFile.write(docIn.toJson(QJsonDocument::Compact));
         inFile.close();
     } else {
         result["success"] = false;
-        result["error"] = "Не удалось создать файл параметров (input.json)";
+        result["error"] = "Не удалось создать input.json: " + inFile.errorString();
         return result;
     }
 
@@ -381,7 +440,12 @@ QVariantMap PluginEngine::runExternalProcess(const CachedConfig &cfg, const QVar
         }
 
         // Передаем Питону путь к скрипту и пути к JSON-файлам
-        args << cfg.entryPoint << inputPath << outputPath;
+        QString nativeInputPath = QDir::toNativeSeparators(inputPath);
+        QString nativeOutputPath = QDir::toNativeSeparators(outputPath);
+        // И для скрипта тоже!
+        QString nativeEntryPoint = QDir::toNativeSeparators(cfg.entryPoint);
+
+        args << nativeEntryPoint << nativeInputPath << nativeOutputPath;
     }
 
     // 3. ЗАПУСКАЕМ ПРОЦЕСС
@@ -389,12 +453,26 @@ QVariantMap PluginEngine::runExternalProcess(const CachedConfig &cfg, const QVar
     process.setWorkingDirectory(cfg.cachePath);
 
     qInfo() << "Запуск внешнего процесса:" << program << args;
+
+#ifdef Q_OS_WIN
+    QProcessEnvironment scriptEnv = QProcessEnvironment::systemEnvironment();
+    scriptEnv.insert("PYTHONIOENCODING", "utf-8");
+    scriptEnv.insert("PYTHONUTF8", "1");
+    process.setProcessEnvironment(scriptEnv);
+#endif
+    // ВАЖНО: не используем ForwardedChannels — при нем stdout/stderr дочернего процесса
+    // уходят напрямую в консоль родителя мимо внутренних буферов Qt, и readAllStandardError()
+    // ниже всегда возвращал бы пустую строку (сообщение об ошибке для пользователя терялось бы).
+    // Дефолтный SeparateChannels буферизует оба потока внутри QProcess.
     process.start(program, args);
 
-    if (!process.waitForFinished(300000)) { // Ждем до 5 минут
+    if (!process.waitForFinished(300000)) {
+        bool failedToStart = (process.error() == QProcess::FailedToStart);
         process.kill();
         result["success"] = false;
-        result["error"] = "Скрипт завис или выполнялся слишком долго!";
+        result["error"] = failedToStart
+                              ? "Не удалось запустить процесс: " + process.errorString()
+                              : "Скрипт завис или выполнялся слишком долго!";
         QFile::remove(inputPath);
         return result;
     }
@@ -405,13 +483,12 @@ QVariantMap PluginEngine::runExternalProcess(const CachedConfig &cfg, const QVar
         // ФИКС КРАКОЗЯБР: Читаем поток ошибок консоли с учетом ОС
         QByteArray stderrBytes = process.readAllStandardError();
         QString stderrText;
-#if defined(Q_OS_WIN)
-        // В Windows консоль обычно выплевывает текст в CP866 (OEM)
-        stderrText = QString::fromLocal8Bit(stderrBytes);
-#else
-        // В Linux/Mac всегда человеческий UTF-8
-        stderrText = QString::fromUtf8(stderrBytes);
-#endif
+
+        if (cfg.configType == "python-script") {
+            stderrText = QString::fromUtf8(stderrBytes);
+        } else {
+            stderrText = QString::fromLocal8Bit(stderrBytes);
+        }
 
         result["error"] = "Ошибка выполнения скрипта:\n" + stderrText;
         QFile::remove(inputPath);
@@ -497,5 +574,5 @@ QString PluginEngine::getPythonExecutable(const CachedConfig &cfg) const
     }
 #endif
 
-    return basePython;
+    return QDir::toNativeSeparators(basePython);
 }

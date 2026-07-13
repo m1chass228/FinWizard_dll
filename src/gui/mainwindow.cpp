@@ -54,7 +54,9 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
     logMessage("Программа запущена. Конфиги загружены из кэша.", false);
 
     // --- 7. ЗАПРЕТ НА ЗАПРЕЩЕННЫЕ СИМВОЛЫ ---
-    QRegularExpression fileRegex("[^\\*\\?\\\"<>\\|/:]*");
+    QRegularExpression fileRegex(R"(^[^*?"<>|/:]*$)");
+
+    // Создаем ОДИН раз, родителем указываем MainWindow (или ui->fileName)
     QRegularExpressionValidator *validator = new QRegularExpressionValidator(fileRegex, this);
     ui->fileName->setValidator(validator);
 
@@ -190,6 +192,8 @@ void MainWindow::setupWidgets()
 
                     // Сбрасываем выбор на самый первый элемент
                     ui->configComboBox->setCurrentIndex(0);
+
+
                 }
             }
         });
@@ -232,16 +236,23 @@ void MainWindow::setupConnections()
 // Вспомогательный метод для очистки стилей
 void MainWindow::clearHoverStyles()
 {
-    // Возвращаем дефолтные стили (можешь настроить под свой темный интерфейс)
-    ui->configComboBox->setStyleSheet("");
-    ui->xlsxList->setStyleSheet("");
+    if (ui->configComboBox->property("dragHover").toBool() == true) {
+        ui->configComboBox->setProperty("dragHover", false);
+        ui->configComboBox->style()->unpolish(ui->configComboBox);
+        ui->configComboBox->style()->polish(ui->configComboBox);
+    }
+    if (ui->xlsxList->property("dragHover").toBool() == true) {
+        ui->xlsxList->setProperty("dragHover", false);
+        ui->xlsxList->style()->unpolish(ui->xlsxList);
+        ui->xlsxList->style()->polish(ui->xlsxList);
+    }
 }
 
 // 1. Файл занесли над окном
 void MainWindow::dragEnterEvent(QDragEnterEvent *event)
 {
     if (event->mimeData()->hasUrls()) {
-        event->acceptProposedAction(); // Разрешаем отслеживание
+        event->acceptProposedAction(); // Разрешаем отслеживание движения
     } else {
         event->ignore();
     }
@@ -255,37 +266,64 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
         return;
     }
 
-    QPoint pos = event->position().toPoint();
+    // ИСПРАВЛЕНИЕ КООРДИНАТ: переводим точку окна в локальные координаты каждого виджета
+    QPoint windowPos = event->position().toPoint();
+    QPoint localComboPos = ui->configComboBox->mapFrom(this, windowPos);
+    QPoint localXlsxPos  = ui->xlsxList->mapFrom(this, windowPos);
+
     QString filePath = event->mimeData()->urls().first().toLocalFile();
     QFileInfo fi(filePath);
     QString ext = fi.suffix().toLower();
     QString compExt = fi.completeSuffix().toLower();
 
     bool isValidPluginArchive = (ext == "zip" || ext == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz"));
-    bool isValidExcelFile = (ext == "xlsx" || ext == "xls");
+    bool isValidExcelFile     = (ext == "xlsx" || ext == "xls");
 
-    // Зона плагинов принимает ТОЛЬКО валидные архивы
-    if (ui->configComboBox->geometry().contains(pos)) {
+    // ПРОВЕРКА ЗОНЫ ПЛАГИНОВ (configComboBox)
+    if (ui->configComboBox->rect().contains(localComboPos)) {
         if (isValidPluginArchive) {
-            ui->configComboBox->setStyleSheet("border: 2px solid #2ecc71; background-color: #1e272e;");
-            ui->xlsxList->setStyleSheet("");
+            // ИСПРАВЛЕНИЕ UX: Используем свойства вместо тяжелого setStyleSheet
+            if (ui->configComboBox->property("dragHover").toBool() != true) {
+                ui->configComboBox->setProperty("dragHover", true);
+                ui->configComboBox->style()->unpolish(ui->configComboBox);
+                ui->configComboBox->style()->polish(ui->configComboBox);
+            }
+            // Гасим подсветку у соседа
+            if (ui->xlsxList->property("dragHover").toBool() != false) {
+                ui->xlsxList->setProperty("dragHover", false);
+                ui->xlsxList->style()->unpolish(ui->xlsxList);
+                ui->xlsxList->style()->polish(ui->xlsxList);
+            }
             event->acceptProposedAction();
             return;
         }
     }
-    // Зона XLSX принимает эксельки ИЛИ архивы, из которых мы их вытащим
-    else if (ui->xlsxList->geometry().contains(pos)) {
+    // ПРОВЕРКА ЗОНЫ XLSX ТАБЛИЦ (xlsxList)
+    else if (ui->xlsxList->rect().contains(localXlsxPos)) {
         if (isValidExcelFile || isValidPluginArchive) {
-            ui->xlsxList->setStyleSheet("border: 2px solid #3498db; background-color: #1e272e;");
-            ui->configComboBox->setStyleSheet("");
+            if (ui->xlsxList->property("dragHover").toBool() != true) {
+                ui->xlsxList->setProperty("setProperty", true); // Свойство dragHover активируется таблицей стилей из main.cpp
+                ui->xlsxList->setProperty("dragHover", true);
+                ui->xlsxList->style()->unpolish(ui->xlsxList);
+                ui->xlsxList->style()->polish(ui->xlsxList);
+            }
+            if (ui->configComboBox->property("dragHover").toBool() != false) {
+                ui->configComboBox->setProperty("dragHover", false);
+                ui->configComboBox->style()->unpolish(ui->configComboBox);
+                ui->configComboBox->style()->polish(ui->configComboBox);
+            }
             event->acceptProposedAction();
             return;
         }
     }
 
-    // Если файл не подходит — тушим рамки и шлем его лесом
-    clearHoverStyles();
-    event->ignore(); // Юзер увидит значок запрета на дроп
+    // Если курсор не попал ни в одну зону или файл не того формата — сбрасываем стили
+    if (ui->configComboBox->property("dragHover").toBool() == true ||
+        ui->xlsxList->property("dragHover").toBool() == true)
+    {
+        clearHoverStyles();
+    }
+    event->ignore();
 }
 
 // 3. Юзер увёл мышь из окна, так и не сбросив файл
@@ -298,27 +336,30 @@ void MainWindow::dragLeaveEvent(QDragLeaveEvent *event)
 // 4. Юзер отпустил кнопку мыши (ДРОП)
 void MainWindow::dropEvent(QDropEvent *event)
 {
-    clearHoverStyles(); // Гасим рамки подсветки
+    clearHoverStyles(); // Сразу тушим подсветку рамок
 
     if (!event->mimeData()->hasUrls() || event->mimeData()->urls().isEmpty()) {
         event->ignore();
         return;
     }
 
-    QPoint pos = event->position().toPoint();
+    // ИСПРАВЛЕНИЕ КООРДИНАТ
+    QPoint windowPos = event->position().toPoint();
+    QPoint localComboPos = ui->configComboBox->mapFrom(this, windowPos);
+    QPoint localXlsxPos  = ui->xlsxList->mapFrom(this, windowPos);
+
     QList<QUrl> urls = event->mimeData()->urls();
     QString filePath = urls.first().toLocalFile();
     QFileInfo fi(filePath);
     QString ext = fi.suffix().toLower();
-    QString compExt = fi.completeSuffix().toLower(); // Для .tar.gz
+    QString compExt = fi.completeSuffix().toLower();
 
-    // Флаг: является ли файл поддерживаемым типом архива
     bool isArchive = (ext == "zip" || ext == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz"));
 
     // ========================================================================
-    // ЗОНА ПЛАГИНОВ (configComboBox)
+    // ОБРАБОТКА: ЗОНА ПЛАГИНОВ (configComboBox)
     // ========================================================================
-    if (ui->configComboBox->geometry().contains(pos)) {
+    if (ui->configComboBox->rect().contains(localComboPos)) {
         if (!isArchive) {
             logMessage("Ошибка: В зону плагинов можно сбрасывать только архивы (ZIP, TAR, TAR.GZ)!", true);
             QMessageBox::critical(this, "Неверный формат", "Сюда можно сбрасывать только файлы плагинов в формате архивов (.zip, .tar, .tar.gz)!");
@@ -326,7 +367,6 @@ void MainWindow::dropEvent(QDropEvent *event)
             return;
         }
 
-        // Вызываем обновленный метод менеджера плагинов
         QPair<int, QString> result = m_pluginManager->addConfigFromArchive(filePath);
         int newId = result.first;
         QString errorMsg = result.second;
@@ -348,9 +388,9 @@ void MainWindow::dropEvent(QDropEvent *event)
     }
 
     // ========================================================================
-    // ЗОНА XLSX ТАБЛИЦ (xlsxList)
+    // ОБРАБОТКА: ЗОНА XLSX ТАБЛИЦ (xlsxList)
     // ========================================================================
-    if (ui->xlsxList->geometry().contains(pos)) {
+    if (ui->xlsxList->rect().contains(localXlsxPos)) {
         QSettings settings("FinWizard", "Settings");
         QString inputFolder = settings.value("inputFolder",
                                              QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input").toString();
@@ -369,7 +409,7 @@ void MainWindow::dropEvent(QDropEvent *event)
             QString curExt = curFi.suffix().toLower();
             QString curCompExt = curFi.completeSuffix().toLower();
 
-            // Если кинули чистый Excel
+            // Если закинули чистый Excel
             if (curExt == "xlsx" || curExt == "xls") {
                 QString dest = inputFolder + "/" + curFi.fileName();
                 if (QFile::copy(curPath, dest)) {
@@ -379,23 +419,21 @@ void MainWindow::dropEvent(QDropEvent *event)
                     logMessage("Ошибка копирования: " + curFi.fileName(), true);
                 }
             }
-            // Если кинули архив с таблицами (ZIP или TAR)
+            // Если закинули архив с таблицами
             else if (curExt == "zip" || curExt == "tar" || curCompExt.endsWith("tar.gz") || curCompExt.endsWith("tgz")) {
                 QTemporaryDir tempDir;
                 if (!tempDir.isValid()) continue;
 
-                // Юзаем наш ArchiveManager! Он атомарен и проверит целостность перед распаковкой
                 if (!ArchiveManager::extractArchive(curPath, tempDir.path())) {
                     logMessage(QString("Ошибка: Архив %1 поврежден или пуст!").arg(curFi.fileName()), true);
                     QMessageBox::critical(this, "Ошибка архива", QString("Не удалось извлечь архив %1. Он поврежден.").arg(curFi.fileName()));
                     continue;
                 }
 
-                // Вытаскиваем эксельки из временной папки
                 QDirIterator it(tempDir.path(), {"*.xlsx", "*.xls"}, QDir::Files, QDirIterator::Subdirectories);
                 while (it.hasNext()) {
                     QString extractedFilePath = it.next();
-                    if (extractedFilePath.contains("__MACOSX")) continue; // Игнорим мусор macOS
+                    if (extractedFilePath.contains("__MACOSX")) continue; // Игнорируем метаданные macOS
 
                     QFileInfo extFi(extractedFilePath);
                     QString dest = inputFolder + "/" + extFi.fileName();
@@ -410,7 +448,7 @@ void MainWindow::dropEvent(QDropEvent *event)
                     }
                 }
             }
-            // Если закинули левый файл (картинку, музыку, софт)
+            // Любой другой тип файлов
             else {
                 logMessage(QString("Файл отклонен (не таблица/архив): %1").arg(curFi.fileName()), true);
                 QMessageBox::warning(this, "Неподдерживаемый файл",
@@ -533,6 +571,11 @@ void MainWindow::onStartClicked()
     }
 
     int id = ui->configComboBox->currentData().toInt();
+    const CachedConfig* cfg = m_pluginManager->getConfig(id); // Или как у тебя реализован геттер
+    if (!cfg) {
+        logMessage("Ошибка: Плагин больше недоступен. Перезапустите сканирование.", true);
+        return;
+    }
 
     // 2. Получаем input файлы
     if (!inputDir.exists()) {
@@ -921,13 +964,11 @@ void MainWindow::updateConfigList()
     ui->configComboBox->setCurrentIndex(indexToSelect);
     ui->configComboBox->blockSignals(false);
 
-    // ВАЖНО: Если мы сбросили на заглушку (индекс 0), нужно вручную очистить
-    // превью интерфейса, чтобы там не висел старый текст
     if (indexToSelect == 0) {
-        // Вызови здесь свой метод очистки превью, например:
-        // updatePreviewFields(QMap<QString, QString>());
-        // или ui->pluginNameLabel->setText("Здесь будет название...");
+        updateConfigPreview(0);
     }
+
+    ui->configComboBox->blockSignals(false);
 }
 
 void MainWindow::onConfigSelected(int index)
@@ -955,9 +996,13 @@ void MainWindow::onConfigSelected(int index)
 
 void MainWindow::updateConfigPreview(int configId)
 {
+    // Сначала жестко сбрасываем всё в дефолтное состояние
     ui->configIcon->clear();
     ui->configName->setText("Не выбрано");
     ui->configDescription->clear();
+
+    // Если ID заглушки, просто выходим (поля уже очищены выше)
+    if (configId <= 0) return;
 
     QMap<QString, QString> preview = m_pluginManager->getConfigPreview(configId);
     if (preview.isEmpty()) return;
@@ -1157,14 +1202,19 @@ void MainWindow::updateInterfaceIcons()
         QColor iconColor = isDark ? QColor(Qt::white) : QColor("#2c3e50");
 
     auto getTintedIcon = [&](const QString &resourcePath) -> QIcon {
-        QPixmap pixmap(resourcePath);
-        if (pixmap.isNull()) return QIcon();
+        QImage img(resourcePath);
+        if (img.isNull()) return QIcon();
 
-        QPainter painter(&pixmap);
-        painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
-        painter.fillRect(pixmap.rect(), iconColor);
-        painter.end();
-        return QIcon(pixmap);
+        // Гарантируем правильный формат для QPainter и прозрачности
+        img = img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+        QPainter painter(&img);
+        if (painter.isActive()) {
+            painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+            painter.fillRect(img.rect(), iconColor);
+            painter.end();
+        }
+        return QIcon(QPixmap::fromImage(img));
     };
 
     // Перекрашиваем каждую кнопку из твоего .ui файла

@@ -4,6 +4,8 @@ add_library(core STATIC
     include/finwizard/archivemanager.h
     src/archivemanager.cpp
 
+
+
 )   # или SHARED, если хочешь dll/so
 
 # Все исходники и заголовки

@@ -6,7 +6,6 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDebug>
-#include <fstream>
 
 #include <quazip/quazip.h>
 #include <quazip/quazipfile.h>
@@ -17,19 +16,16 @@ PluginRepository::PluginRepository(QSettings &settings) : m_settings(settings) {
 
 // ----------------- AVAILABLE ID ------------------------------
 
-int PluginRepository::nextAvailableId() const {
-    // Читаем последний выданный ID из настроек, по дефолту 0
+int PluginRepository::nextAvailableId() {
     int lastId = m_settings.value("plugins/last_used_id", 0).toInt();
     int nextId = lastId + 1;
 
-    // На всякий случай проверяем, вдруг папка с таким ID физически существует на диске
     QString base = getCacheBasePath();
     while (QDir(base + QDir::separator() + QString::number(nextId)).exists()) {
         nextId++;
     }
 
-    // Сохраняем новый "счетчик"
-    const_cast<QSettings&>(m_settings).setValue("plugins/last_used_id", nextId);
+    m_settings.setValue("plugins/last_used_id", nextId);
     return nextId;
 }
 
@@ -50,7 +46,7 @@ QList<int> PluginRepository::getAllConfigIds() const {
 
 // ----------------- ADD CONFIG (ZIP)----------------------------
 
-QPair<int, QString> PluginRepository::addConfigFromFile(const QString &filePath)
+QPair<int, QString> PluginRepository::addConfigFromArchive(const QString &filePath)
 {
     if (!QFile::exists(filePath)) {
         return {-1, "Файл не существует или недоступен для чтения."};
@@ -219,7 +215,7 @@ QString PluginRepository::createCacheDirForId(int id)
     QDir dir(dirPath);
     if (!dir.mkpath(".")) {
         qWarning() << "Не удалось создать папку кэша:" << dirPath;
-            return {};
+        return {};
     }
     return dirPath;
 }
@@ -343,7 +339,3 @@ QMap<QString, QString> PluginRepository::getConfigPreview(int id) const
 
     return preview;
 }
-
-
-
-

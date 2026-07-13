@@ -27,7 +27,8 @@ extern "C" {
 
 static int mem_read(mtar_t* t, void* r_data, unsigned size) {
     auto* s = static_cast<MemoryTarStream*>(t->stream);
-    if (s->pos + size > s->size) return MTAR_EFAILURE;
+    // Вычитание вместо сложения: не переполняется даже если pos близок к максимуму size_t
+    if (s->pos > s->size || size > s->size - s->pos) return MTAR_EFAILURE;
     std::memcpy(r_data, s->data + s->pos, size);
     s->pos += size;
     return MTAR_ESUCCESS;
@@ -44,12 +45,46 @@ static int mem_close(mtar_t*) {
     return MTAR_ESUCCESS;
 }
 
+// --- Защита от path traversal ("tar slip"): вредоносный архив может содержать
+// имена вида "../../etc/passwd" или абсолютные пути, которые без проверки
+// уводят запись за пределы целевой директории. ---
+static bool safeJoinTarPath(const fs::path& baseDir, const std::string& entryName, fs::path& outPath) {
+    if (entryName.empty()) return false;
+
+    fs::path rel(entryName);
+    if (rel.is_absolute()) return false;
+
+    fs::path base = baseDir.lexically_normal();
+    fs::path candidate = (base / rel).lexically_normal();
+
+    // Приводим оба пути к строкам для честного сравнения префикса
+    const std::string baseStr = base.string();
+    const std::string candStr = candidate.string();
+
+    if (candStr.size() < baseStr.size() || candStr.compare(0, baseStr.size(), baseStr) != 0) {
+        return false; // ушли выше baseDir через "../.."
+    }
+    // Защита от ложного совпадения префикса без разделителя (base=/tmp/out, candidate=/tmp/outEvil)
+    if (candStr.size() > baseStr.size()) {
+        char sep = candStr[baseStr.size()];
+        if (sep != '/' && sep != fs::path::preferred_separator) return false;
+    }
+
+    outPath = candidate;
+    return true;
+}
+
 // --- Реализация методов ArchiveManager ---
 
 bool ArchiveManager::extractArchive(const QString &archivePath, const QString &targetDir)
 {
     QFileInfo fi(archivePath);
     QString compExt = fi.completeSuffix().toLower();
+
+    // Буфер TAR, прочитанный и провалидированный на ЭТАПЕ 1. Переиспользуем его же
+    // на ЭТАПЕ 2, чтобы не читать файл с диска второй раз (TOCTOU: между двумя чтениями
+    // содержимое файла могло измениться) и не декомпрессировать gzip повторно.
+    std::vector<char> tarBuffer;
 
     // ========================================================================
     // ЭТАП 1: ВАЛИДАЦИЯ (Сухая проверка структуры БЕЗ создания мусора на диске)
@@ -63,8 +98,6 @@ bool ArchiveManager::extractArchive(const QString &archivePath, const QString &t
         zip.close();
     }
     else if (compExt == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz")) {
-        std::vector<char> tarBuffer;
-
         if (compExt == "tar") {
             std::ifstream in(archivePath.toStdString(), std::ios::binary | std::ios::ate);
             if (!in.is_open()) return false;
@@ -102,11 +135,9 @@ bool ArchiveManager::extractArchive(const QString &archivePath, const QString &t
     if (compExt.endsWith("zip")) {
         extractSuccess = !JlCompress::extractDir(archivePath, targetDir).isEmpty();
     }
-    else if (compExt == "tar") {
-        extractSuccess = extractPureTar(archivePath, targetDir);
-    }
-    else if (compExt.endsWith("tar.gz") || compExt.endsWith("tgz")) {
-        extractSuccess = extractTarGz(archivePath, targetDir);
+    else {
+        // TAR / TAR.GZ / TGZ — используем тот же буфер, что и на этапе валидации
+        extractSuccess = extractTarFromBuffer(tarBuffer, targetDir);
     }
 
     return extractSuccess;
@@ -173,14 +204,19 @@ QPair<bool, QString> ArchiveManager::validateTarBuffer(const std::vector<char>& 
         status = mtar_next(&tar);
         if (status != MTAR_ESUCCESS) {
             if (status == MTAR_ENULLRECORD) break; // Нормальное окончание TAR
+            mtar_close(&tar);
             return {false, QString("Архив поврежден на файле №%1 (%2)").arg(fileCount).arg(header.name)};
         }
     }
 
     if (status != MTAR_ESUCCESS && status != MTAR_ENULLRECORD) {
+        mtar_close(&tar);
         return {false, QString("Ошибка парсинга структуры TAR. Код: %1").arg(status)};
     }
-    if (fileCount == 0) return {false, "Архив не содержит файлов."};
+    if (fileCount == 0) {
+        mtar_close(&tar);
+        return {false, "Архив не содержит файлов."};
+    }
 
     mtar_close(&tar);
     return {true, ""};
@@ -198,9 +234,17 @@ bool ArchiveManager::extractTarFromBuffer(const std::vector<char>& tarBuffer, co
     tar.seek = mem_seek;
     tar.close = mem_close;
 
+    const fs::path baseDir = fs::path(destDir.toStdString());
+
     mtar_header_t header;
-    while (mtar_read_header(&tar, &header) == MTAR_ESUCCESS) {
-        fs::path targetPath = fs::path(destDir.toStdString()) / header.name;
+    int status;
+    while ((status = mtar_read_header(&tar, &header)) == MTAR_ESUCCESS) {
+        fs::path targetPath;
+        if (!safeJoinTarPath(baseDir, header.name, targetPath)) {
+            qWarning() << "[ArchiveManager] Обнаружена попытка выхода за пределы целевой папки (path traversal), запись отклонена:" << header.name;
+            mtar_close(&tar);
+            return false;
+        }
 
         if (header.type == MTAR_TDIR) {
             fs::create_directories(targetPath);
@@ -210,21 +254,35 @@ bool ArchiveManager::extractTarFromBuffer(const std::vector<char>& tarBuffer, co
             }
 
             std::ofstream outFile(targetPath, std::ios::binary);
-            if (!outFile.is_open()) return false;
+            if (!outFile.is_open()) {
+                mtar_close(&tar);
+                return false;
+            }
 
             if (header.size > 0) {
                 std::vector<char> fileData(header.size);
                 if (mtar_read_data(&tar, fileData.data(), header.size) != MTAR_ESUCCESS) {
                     outFile.close();
+                    mtar_close(&tar);
                     return false;
                 }
                 outFile.write(fileData.data(), header.size);
             }
             outFile.close();
         }
-        if (mtar_next(&tar) != MTAR_ESUCCESS) break;
+
+        status = mtar_next(&tar);
+        if (status != MTAR_ESUCCESS) break;
     }
 
     mtar_close(&tar);
+
+    // Различаем нормальный конец архива (MTAR_ENULLRECORD) от реального сбоя парсинга —
+    // раньше функция в обоих случаях молча возвращала true.
+    if (status != MTAR_ESUCCESS && status != MTAR_ENULLRECORD) {
+        qWarning() << "[ArchiveManager] Архив поврежден в процессе распаковки. Код:" << status;
+        return false;
+    }
+
     return true;
 }

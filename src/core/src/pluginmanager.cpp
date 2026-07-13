@@ -9,17 +9,18 @@ PluginManager::PluginManager(QObject *parent)
     // При старте программы автоматически сканируем кэш
     m_repository.refreshPlugins();
 
+    // Безопасные прокси-коннекты от движка к менеджеру
     connect(&m_engine, &PluginEngine::pipLogReady, this, &PluginManager::pluginLogReceived, Qt::UniqueConnection);
     connect(&m_engine, &PluginEngine::pipFinished, this, &PluginManager::pluginReadyChanged, Qt::UniqueConnection);
-
-    connect(&m_engine, &PluginEngine::pluginFinished, this, &PluginManager::pluginFinished);
+    connect(&m_engine, &PluginEngine::pluginFinished, this, &PluginManager::pluginFinished, Qt::UniqueConnection);
 }
 
 PluginManager::~PluginManager()
 {
-    // Нам не нужно писать код очистки памяти!
-    // m_engine сам выгрузит все DLL в своем деструкторе.
-    // m_settings сам сохранит данные на диск.
+    // ЖЕСТКИЙ ФИКС УТЕЧЕК И UB:
+    // Явно разрываем связи движка с менеджером перед уничтожением полей,
+    // чтобы доживающие свой век в deleteLater процессы pip не слали сигналы в мертвый класс.
+    m_engine.disconnect(this);
 }
 
 QPair<int, QString> PluginManager::addConfigFromArchive(const QString &archivePath)
@@ -29,33 +30,51 @@ QPair<int, QString> PluginManager::addConfigFromArchive(const QString &archivePa
     for (int id : m_repository.getAllConfigIds()) {
         const CachedConfig* cfg = m_repository.getConfig(id);
         if (cfg && cfg->originalZipPath == archivePath) {
-            m_engine.unloadPlugin(id); // Выгружаем динамическую либу/скрипт из памяти
-            break;
+            m_engine.unloadPlugin(id); // Выгружаем динамическую либу/скрипт
         }
     }
 
-    return m_repository.addConfigFromFile(archivePath);
+    // 2. Делегируем добавление репозиторию
+    return m_repository.addConfigFromArchive(archivePath);
 }
 
-// В pluginmanager.cpp
-void PluginManager::removeConfig(int id) {
+void PluginManager::removeConfig(int id)
+{
+    // Перед удалением файлов с диска обязательно выгружаем плагин из памяти движка
+    m_engine.unloadPlugin(id);
     m_repository.removeConfig(id);
 }
 
 QVariantMap PluginManager::runConfig(int id, const QVariantMap &params)
 {
-    // 1. Спрашиваем у Склада описание плагина
     const CachedConfig* cfg = m_repository.getConfig(id);
-    if (!cfg || !cfg->isValid) {
-        qWarning() << "Попытка запустить невалидный или несуществующий плагин ID:" << id;
-        QVariantMap errorResult;
-        errorResult["success"] = false;
-        errorResult["error"] = QString("Попытка запустить невалидный или несуществующий плагин ID:").arg(id);
-        return errorResult;
+    if (!cfg) {
+        qWarning() << "[МЕНЕДЖЕР] Попытка запустить несуществующий плагин с ID:" << id;
+        QVariantMap result;
+        result["success"] = false;
+        result["error"] = "Плагин не найден в репозитории.";
+        return result;
     }
 
-    // 2. Отдаем конфиг Движку для выполнения
+    if (!cfg->isValid) {
+        qWarning() << "[МЕНЕДЖЕР] Попытка запустить невалидный плагин с ID:" << id;
+        QVariantMap result;
+        result["success"] = false;
+        result["error"] = "Конфигурация плагина невалидна: " + cfg->validationMessage;
+        return result;
+    }
+
+    qInfo() << "[МЕНЕДЖЕР] Передаю плагин" << cfg->displayName << "(ID:" << id << ") в движок...";
+
+    // Движок сам разберется: если зависимости стоят — выполнит синхронно и вернет результат;
+    // если нет — асинхронно запустит PIP (вернет isInitializing=true), а по завершении установки
+    // сам выполнит отложенный запуск и пришлет результат через сигнал pluginFinished.
     return m_engine.runPlugin(*cfg, params);
+}
+
+const CachedConfig* PluginManager::getConfig(int id) const
+{
+    return m_repository.getConfig(id);
 }
 
 void PluginManager::unloadPlugin(int id)
@@ -116,6 +135,12 @@ QString PluginManager::getCacheBasePath() const
 
 void PluginManager::setCacheBasePath(const QString &path)
 {
+    // Защита: не меняем пути на лету, если ставится плагин
+    if (m_engine.isWaitingForPip()) {
+        qWarning() << "[МЕНЕДЖЕР] Смена пути кэша заблокирована: работает PIP!";
+        return;
+    }
+
     // При смене папки нужно выгрузить все текущие плагины из памяти
     for (int id : m_repository.getAllConfigIds()) {
         m_engine.unloadPlugin(id);
@@ -126,5 +151,10 @@ void PluginManager::setCacheBasePath(const QString &path)
 
 void PluginManager::refreshPlugins()
 {
+    if (m_engine.isWaitingForPip()) {
+        qWarning() << "[МЕНЕДЖЕР] Фоновое сканирование отклонено: в данный момент ставится PIP зависимость.";
+        return;
+    }
+
     m_repository.refreshPlugins();
 }

@@ -28,6 +28,8 @@ public:
     // Запускает метод execute()
     QVariantMap runPlugin(const CachedConfig &cfg, const QVariantMap &params);
 
+    bool isWaitingForPip() const { return m_isWaitingForPip; }
+
 signals:
     void pipLogReady(int id, const QString &text);
     void pipFinished(int id, bool success);

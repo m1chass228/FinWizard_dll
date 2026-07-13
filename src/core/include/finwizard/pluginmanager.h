@@ -4,6 +4,9 @@
 #include <QObject>
 #include <QVariantMap>
 #include <QSettings>
+#include <QPair>
+#include <QStringList>
+#include <QMap>
 
 #include "finwizard/pluginrepository.h"
 #include "finwizard/pluginengine.h"
@@ -18,10 +21,12 @@ public:
     // --- Основное API ---
     QPair<int, QString> addConfigFromArchive(const QString &archivePath);
     void removeConfig(int id);
+
     QVariantMap runConfig(int id, const QVariantMap &params);
     void unloadPlugin(int id);
 
-    // --- Информация для UI ---
+    // --- Информация для UI (с гарантией потокобезопасности/валидации) ---
+    const CachedConfig* getConfig(int id) const;
     QList<int> getAllConfigIds() const;
     QStringList getDisplayNames() const;
     QMap<int, QString> getAvailableConfigs() const;
@@ -32,19 +37,20 @@ public:
     void setCacheBasePath(const QString &path);
     void refreshPlugins();
 
-private:
-    QSettings m_settings;
-    PluginRepository m_repository;
-    PluginEngine m_engine;
-
 signals:
-    // Сигнал передает ID плагина и строчку лога из pip
+    // Сигнал передает ID плагина и строчку лога из pip/процесса
     void pluginLogReceived(int id, const QString &text);
 
     // Сигнал сообщает, успешно ли завершилась установка зависимостей
     void pluginReadyChanged(int id, bool ready);
 
+    // Сигнал возврата результатов работы плагина (успех, сообщение, путь к итоговому XLSX)
     void pluginFinished(int id, bool success, const QString &message, const QString &outputPath);
+
+private:
+    QSettings m_settings;
+    PluginRepository m_repository;
+    PluginEngine m_engine;
 };
 
 #endif // PLUGINMANAGER_H
