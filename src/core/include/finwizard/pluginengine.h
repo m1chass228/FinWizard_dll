@@ -30,6 +30,10 @@ public:
 
     bool isWaitingForPip() const { return m_isWaitingForPip; }
 
+    // Занят ли движок выполнением внешнего процесса (.exe / .py) прямо сейчас.
+    // UI должен блокировать повторный запуск, пока это true.
+    bool isRunningExternalProcess() const { return m_execProcess != nullptr; }
+
 signals:
     void pipLogReady(int id, const QString &text);
     void pipFinished(int id, bool success);
@@ -41,13 +45,13 @@ private:
 
     bool setupPythonEnvironment(const CachedConfig &cfg);
 
-    // Универсальный метод для запуска .exe, .py и вообще любых внешних скриптов
-    QVariantMap runExternalProcess(const CachedConfig &cfg, const QVariantMap &params);
+    bool startExternalProcessAsync(const CachedConfig &cfg, const QVariantMap &params, QString &startupError);
 
     std::map<int, std::unique_ptr<QPluginLoader>> m_loaders;
     std::map<int, IConfig*> m_activeConfigs;
 
     QProcess *m_pipProcess = nullptr;
+    QProcess *m_execProcess = nullptr; // Плагин (.exe/.py), выполняющийся асинхронно прямо сейчас
 
     QString getPythonExecutable(const CachedConfig &cfg) const;
 

@@ -136,9 +136,14 @@ QString PluginManager::getCacheBasePath() const
 
 void PluginManager::setCacheBasePath(const QString &path)
 {
-    // Защита: не меняем пути на лету, если ставится плагин
+    // Защита: не меняем пути на лету, если ставится плагин или сам плагин сейчас выполняется —
+    // иначе можно выдернуть кэш/входные файлы прямо из-под работающего процесса.
     if (m_engine.isWaitingForPip()) {
         qWarning() << "[МЕНЕДЖЕР] Смена пути кэша заблокирована: работает PIP!";
+        return;
+    }
+    if (m_engine.isRunningExternalProcess()) {
+        qWarning() << "[МЕНЕДЖЕР] Смена пути кэша заблокирована: выполняется плагин!";
         return;
     }
 

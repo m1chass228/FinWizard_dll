@@ -23,6 +23,12 @@ PluginEngine::~PluginEngine()
         delete m_pipProcess;
         m_pipProcess = nullptr;
     }
+    if (m_execProcess) {
+        m_execProcess->disconnect();
+        m_execProcess->kill();
+        delete m_execProcess;
+        m_execProcess = nullptr;
+    }
     m_isWaitingForPip = false;
 }
 
@@ -206,19 +212,14 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
                                  m_isWaitingForPip = false;
                                  qInfo() << "🚀 [ДВИЖОК] Запускаю отложенный Python-скрипт...";
 
-                                 // Чтобы тяжелый runExternalProcess не блокировал калбэк завершения,
-                                 // вызываем его через метасистему (асинхронно в следующем тике таймера)
+                                 // Запускаем отложенный скрипт асинхронно — startExternalProcessAsync
+                                 // сам эмитит pluginFinished, когда процесс реально завершится.
                                  QMetaObject::invokeMethod(this, [this, cfg]() {
-                                     QVariantMap runResult = runExternalProcess(m_delayedCfg, m_delayedParams);
-                                     qDebug() << "Результат автоматического запуска скрипта движком:" << runResult;
-
-                                     bool scriptSuccess = runResult.value("success").toBool();
-                                     QString msg = runResult.value("message").toString();
-                                     QString outPath = runResult.value("outputPath").toString();
-                                     if (!scriptSuccess && msg.isEmpty()) {
-                                         msg = runResult.value("error").toString();
+                                     QString startupError;
+                                     if (!startExternalProcessAsync(m_delayedCfg, m_delayedParams, startupError)) {
+                                         qWarning() << "Не удалось запустить отложенный скрипт:" << startupError;
+                                         emit pluginFinished(cfg.id, false, startupError, QString());
                                      }
-                                     emit pluginFinished(cfg.id, scriptSuccess, msg, outPath);
                                  }, Qt::QueuedConnection);
 
                              } else {
@@ -386,7 +387,31 @@ QVariantMap PluginEngine::runPlugin(const CachedConfig &cfg, const QVariantMap &
             }
         }
 
-        return runExternalProcess(cfg, params);
+        // Не даем запустить второй внешний процесс, пока первый еще не завершился —
+        // иначе они начнут делить один и тот же input_/output_<id>.json.
+        if (m_execProcess) {
+            QVariantMap busyResult;
+            busyResult["success"] = false;
+            busyResult["error"] = "Другой плагин уже выполняется. Дождитесь его завершения.";
+            return busyResult;
+        }
+
+        QString startupError;
+        if (!startExternalProcessAsync(cfg, params, startupError)) {
+            QVariantMap failResult;
+            failResult["success"] = false;
+            failResult["error"] = startupError;
+            return failResult;
+        }
+
+        // Процесс реально запущен и работает в фоне. Финальный результат придет
+        // асинхронно через сигнал pluginFinished — раньше runExternalProcess()
+        // блокировал этот же поток вызовом waitForFinished(300000) на 5 минут.
+        QVariantMap runningResult;
+        runningResult["success"] = false;
+        runningResult["isRunning"] = true;
+        runningResult["error"] = "Плагин запущен и выполняется в фоне...";
+        return runningResult;
     }
 
     if (!loadPlugin(cfg)) {
@@ -399,12 +424,10 @@ QVariantMap PluginEngine::runPlugin(const CachedConfig &cfg, const QVariantMap &
     IConfig *plugin = m_activeConfigs[cfg.id];
     return plugin->execute(params);
 }
-// ---------------- RUN EXTERNAL PROCESS -------------------------
+// ---------------- RUN EXTERNAL PROCESS (АСИНХРОННО) -------------------------
 
-QVariantMap PluginEngine::runExternalProcess(const CachedConfig &cfg, const QVariantMap &params)
+bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVariantMap &params, QString &startupError)
 {
-    QVariantMap result;
-
     QString inputPath = cfg.cachePath + QString("/input_%1.json").arg(cfg.id);
     QString outputPath = cfg.cachePath + QString("/output_%1.json").arg(cfg.id);
 
@@ -415,9 +438,8 @@ QVariantMap PluginEngine::runExternalProcess(const CachedConfig &cfg, const QVar
         inFile.write(docIn.toJson(QJsonDocument::Compact));
         inFile.close();
     } else {
-        result["success"] = false;
-        result["error"] = "Не удалось создать input.json: " + inFile.errorString();
-        return result;
+        startupError = "Не удалось создать input.json: " + inFile.errorString();
+        return false;
     }
 
     QFile::remove(outputPath); // Удаляем старый результат, если был
@@ -427,99 +449,130 @@ QVariantMap PluginEngine::runExternalProcess(const CachedConfig &cfg, const QVar
     QStringList args;
 
     if (cfg.configType == "executable") {
-        // Просто запускаем бинарник
         program = cfg.entryPoint;
         args << inputPath << outputPath;
     }
     else if (cfg.configType == "python-script") {
-        // Используем наш новый хелпер — он сам выберет venv или базу
         program = getPythonExecutable(cfg);
 
         if (program.isEmpty()) {
-            result["success"] = false;
-            result["error"] = "Интерпретатор Python не найден в системе!";
+            startupError = "Интерпретатор Python не найден в системе!";
             QFile::remove(inputPath);
-            return result;
+            return false;
         }
 
-        // Передаем Питону путь к скрипту и пути к JSON-файлам
         QString nativeInputPath = QDir::toNativeSeparators(inputPath);
         QString nativeOutputPath = QDir::toNativeSeparators(outputPath);
-        // И для скрипта тоже!
         QString nativeEntryPoint = QDir::toNativeSeparators(cfg.entryPoint);
 
         args << nativeEntryPoint << nativeInputPath << nativeOutputPath;
     }
 
-    // 3. ЗАПУСКАЕМ ПРОЦЕСС
-    QProcess process;
-    process.setWorkingDirectory(cfg.cachePath);
+    // 3. ЗАПУСКАЕМ ПРОЦЕСС АСИНХРОННО
+    m_execProcess = new QProcess(this);
+    QProcess *proc = m_execProcess; // Локальная копия для безопасного использования в лямбдах
+    proc->setWorkingDirectory(cfg.cachePath);
 
-    qInfo() << "Запуск внешнего процесса:" << program << args;
+    qInfo() << "Запуск внешнего процесса (асинхронно):" << program << args;
 
 #ifdef Q_OS_WIN
     QProcessEnvironment scriptEnv = QProcessEnvironment::systemEnvironment();
     scriptEnv.insert("PYTHONIOENCODING", "utf-8");
     scriptEnv.insert("PYTHONUTF8", "1");
-    process.setProcessEnvironment(scriptEnv);
+    proc->setProcessEnvironment(scriptEnv);
 #endif
-    // ВАЖНО: не используем ForwardedChannels — при нем stdout/stderr дочернего процесса
-    // уходят напрямую в консоль родителя мимо внутренних буферов Qt, и readAllStandardError()
-    // ниже всегда возвращал бы пустую строку (сообщение об ошибке для пользователя терялось бы).
-    // Дефолтный SeparateChannels буферизует оба потока внутри QProcess.
-    process.start(program, args);
 
-    if (!process.waitForFinished(300000)) {
-        bool failedToStart = (process.error() == QProcess::FailedToStart);
-        process.kill();
-        result["success"] = false;
-        result["error"] = failedToStart
-                              ? "Не удалось запустить процесс: " + process.errorString()
-                              : "Скрипт завис или выполнялся слишком долго!";
+    const QString configType = cfg.configType;
+    const int cfgId = cfg.id;
+
+    QObject::connect(proc, &QProcess::errorOccurred, proc, [this, proc, cfgId, inputPath](QProcess::ProcessError error) {
+        qWarning() << "Ошибка внешнего процесса плагина:" << error << proc->errorString();
+
+        bool failedToStart = (error == QProcess::FailedToStart);
         QFile::remove(inputPath);
-        return result;
-    }
 
-    if (process.exitCode() != 0) {
-        result["success"] = false;
-
-        // ФИКС КРАКОЗЯБР: Читаем поток ошибок консоли с учетом ОС
-        QByteArray stderrBytes = process.readAllStandardError();
-        QString stderrText;
-
-        if (cfg.configType == "python-script") {
-            stderrText = QString::fromUtf8(stderrBytes);
-        } else {
-            stderrText = QString::fromLocal8Bit(stderrBytes);
+        if (m_execProcess == proc) {
+            m_execProcess = nullptr;
         }
 
-        result["error"] = "Ошибка выполнения скрипта:\n" + stderrText;
-        QFile::remove(inputPath);
-        return result;
-    }
+        emit pluginFinished(cfgId, false,
+                            failedToStart ? "Не удалось запустить процесс: " + proc->errorString()
+                                          : "Скрипт завис или упал в процессе выполнения.",
+                            QString());
+        proc->disconnect();
+        proc->deleteLater();
+    });
 
-    // 4. ЧИТАЕМ РЕЗУЛЬТАТ (output.json)
-    QFile outFile(outputPath);
-    if (outFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        QJsonDocument docOut = QJsonDocument::fromJson(outFile.readAll());
-        outFile.close();
+    QObject::connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), proc,
+                     [this, proc, cfgId, configType, inputPath, outputPath](int exitCode, QProcess::ExitStatus exitStatus) {
 
-        if (docOut.isObject()) {
-            result = docOut.object().toVariantMap();
-        } else {
-            result["success"] = false;
-            result["error"] = "Скрипт вернул невалидный JSON.";
+                         QVariantMap result;
+
+                         if (exitStatus != QProcess::NormalExit) {
+                             result["success"] = false;
+                             result["error"] = "Скрипт завершился аварийно (сбой процесса).";
+                         }
+                         else if (exitCode != 0) {
+                             // ФИКС КРАКОЗЯБР: Читаем поток ошибок консоли с учетом ОС
+                             QByteArray stderrBytes = proc->readAllStandardError();
+                             QString stderrText = (configType == "python-script")
+                                                      ? QString::fromUtf8(stderrBytes)
+                                                      : QString::fromLocal8Bit(stderrBytes);
+
+                             result["success"] = false;
+                             result["error"] = "Ошибка выполнения скрипта:\n" + stderrText;
+                         }
+                         else {
+                             // Читаем результат (output.json)
+                             QFile outFile(outputPath);
+                             if (outFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                                 QJsonDocument docOut = QJsonDocument::fromJson(outFile.readAll());
+                                 outFile.close();
+
+                                 if (docOut.isObject()) {
+                                     result = docOut.object().toVariantMap();
+                                 } else {
+                                     result["success"] = false;
+                                     result["error"] = "Скрипт вернул невалидный JSON.";
+                                 }
+                             } else {
+                                 result["success"] = false;
+                                 result["error"] = "Скрипт не создал файл output.json (возможно, упал молча).";
+                             }
+                         }
+
+                         QFile::remove(inputPath);
+                         QFile::remove(outputPath);
+
+                         bool success = result.value("success").toBool();
+                         QString msg = result.value("message").toString();
+                         QString outPath = result.value("outputPath").toString();
+                         if (!success && msg.isEmpty()) {
+                             msg = result.value("error").toString();
+                         }
+
+                         if (m_execProcess == proc) {
+                             m_execProcess = nullptr;
+                         }
+
+                         emit pluginFinished(cfgId, success, msg, outPath);
+                         proc->deleteLater();
+                     });
+
+    proc->start(program, args);
+
+    if (!proc->waitForStarted(5000)) {
+        startupError = "Не удалось запустить процесс: " + proc->errorString();
+        if (m_execProcess == proc) {
+            m_execProcess = nullptr;
         }
-    } else {
-        result["success"] = false;
-        result["error"] = "Скрипт не создал файл output.json (возможно, упал молча).";
+        proc->disconnect();
+        proc->deleteLater();
+        QFile::remove(inputPath);
+        return false;
     }
 
-    // 5. Уборка
-    QFile::remove(inputPath);
-    QFile::remove(outputPath);
-
-    return result;
+    return true;
 }
 QString PluginEngine::getPythonExecutable(const CachedConfig &cfg) const
 {

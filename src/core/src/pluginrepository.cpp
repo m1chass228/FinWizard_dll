@@ -265,6 +265,16 @@ CachedConfig PluginRepository::parseManifest(const QString &dirPath) const
     if (!dllName.isEmpty()) {
         cfg.entryPoint = QDir(dirPath).absoluteFilePath(dllName);
 
+        // Защита от path traversal через manifest.json: значение "entry" вида
+        // "../../../etc/something" не должно позволить точке входа плагина
+        // выйти за пределы его собственной папки кэша (dirPath).
+        QString normalizedBase = QDir::cleanPath(QDir(dirPath).absolutePath());
+        QString normalizedEntry = QDir::cleanPath(cfg.entryPoint);
+        if (normalizedEntry != normalizedBase && !normalizedEntry.startsWith(normalizedBase + "/")) {
+            cfg.validationMessage = "Точка входа плагина выходит за пределы папки кэша (недопустимый путь в manifest.json).";
+            return cfg;
+        }
+
         if (QFile::exists(cfg.entryPoint)) {
             // --- СТРОГАЯ ПРОВЕРКА ТИПОВ И РАСШИРЕНИЙ ---
 

@@ -80,7 +80,6 @@ MainWindow::~MainWindow()
 void MainWindow::initSettingsAndPaths()
 {
     // --- 1. ПУТИ И НАСТРОЙКИ ---
-    QSettings settings("FinWizard", "Settings");
 
     QString defaultCachePath;
     QString defaultInputPath;
@@ -95,8 +94,8 @@ void MainWindow::initSettingsAndPaths()
     defaultInputPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input";
 #endif
 
-    m_configsPath = settings.value("cache/path", defaultCachePath).toString();
-    m_inputPath = settings.value("inputFolder", defaultInputPath).toString();
+    m_configsPath = m_appSettings.value("cache/path", defaultCachePath).toString();
+    m_inputPath = m_appSettings.value("inputFolder", defaultInputPath).toString();
 
     QDir().mkpath(m_configsPath);
     QDir().mkpath(m_inputPath);
@@ -305,8 +304,7 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
     else if (ui->xlsxList->rect().contains(localXlsxPos)) {
         if (isValidExcelFile || isValidPluginArchive) {
             if (ui->xlsxList->property("dragHover").toBool() != true) {
-                ui->xlsxList->setProperty("setProperty", true); // Свойство dragHover активируется таблицей стилей из main.cpp
-                ui->xlsxList->setProperty("dragHover", true);
+                ui->xlsxList->setProperty("dragHover", true); // Свойство dragHover активируется таблицей стилей из main.cpp
                 ui->xlsxList->style()->unpolish(ui->xlsxList);
                 ui->xlsxList->style()->polish(ui->xlsxList);
             }
@@ -370,19 +368,39 @@ void MainWindow::dropEvent(QDropEvent *event)
             return;
         }
 
-        QPair<int, QString> result = m_pluginManager->addConfigFromArchive(filePath);
-        int newId = result.first;
-        QString errorMsg = result.second;
+        // Раньше обрабатывался только urls.first() — если юзер разом кидал несколько
+        // архивов плагинов, остальные молча пропадали без единого сообщения об этом.
+        int lastAddedId = -1;
+        int addedCount = 0;
+        for (const QUrl &url : urls) {
+            QString curPath = url.toLocalFile();
+            QFileInfo curFi(curPath);
+            QString curExt = curFi.suffix().toLower();
+            QString curCompExt = curFi.completeSuffix().toLower();
+            bool curIsArchive = (curExt == "zip" || curExt == "tar" || curCompExt.endsWith("tar.gz") || curCompExt.endsWith("tgz"));
 
-        if (newId != -1) {
-            logMessage("Плагин успешно добавлен! ID: " + QString::number(newId), false);
-            updateConfigList();
+            if (!curIsArchive) {
+                logMessage("Пропущен файл (не архив плагина): " + curFi.fileName(), true);
+                continue;
+            }
 
-            int newIndex = ui->configComboBox->findData(newId);
+            QPair<int, QString> result = m_pluginManager->addConfigFromArchive(curPath);
+            if (result.first != -1) {
+                logMessage("Плагин успешно добавлен! ID: " + QString::number(result.first), false);
+                lastAddedId = result.first;
+                addedCount++;
+            } else {
+                logMessage("Ошибка добавления плагина '" + curFi.fileName() + "': " + result.second, true);
+                QMessageBox::critical(this, "Ошибка добавления плагина", curFi.fileName() + ":\n" + result.second);
+            }
+        }
+
+        updateConfigList();
+
+        if (lastAddedId != -1) {
+            int newIndex = ui->configComboBox->findData(lastAddedId);
             if (newIndex != -1) ui->configComboBox->setCurrentIndex(newIndex);
-        } else {
-            logMessage("Ошибка добавления плагина: " + errorMsg, true);
-            QMessageBox::critical(this, "Ошибка добавления плагина", errorMsg);
+        } else if (addedCount == 0) {
             ui->configComboBox->setCurrentIndex(0);
         }
 
@@ -394,9 +412,8 @@ void MainWindow::dropEvent(QDropEvent *event)
     // ОБРАБОТКА: ЗОНА XLSX ТАБЛИЦ (xlsxList)
     // ========================================================================
     if (ui->xlsxList->rect().contains(localXlsxPos)) {
-        QSettings settings("FinWizard", "Settings");
-        QString inputFolder = settings.value("inputFolder",
-                                             QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input").toString();
+        QString inputFolder = m_appSettings.value("inputFolder",
+                                                  QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input").toString();
 
         QDir inputDir(inputFolder);
         if (!inputDir.exists() && !inputDir.mkpath(".")) {
@@ -476,9 +493,8 @@ void MainWindow::showXlsxContextMenu(const QPoint &pos)
     QMenu contextMenu(this);
 
     // Вытаскиваем путь один раз и с безопасным дефолтом
-    QSettings settings("FinWizard", "Settings");
     QString defaultInput = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input";
-    QString inputFolder = settings.value("inputFolder", defaultInput).toString();
+    QString inputFolder = m_appSettings.value("inputFolder", defaultInput).toString();
     QDir dir(inputFolder);
 
     if (item) {
@@ -564,8 +580,7 @@ void MainWindow::onDeleteConfigClicked()
 
 void MainWindow::onStartClicked()
 {
-    QSettings settings("FinWizard", "Settings");
-    QDir inputDir(settings.value("inputFolder", QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString());
+    QDir inputDir(m_appSettings.value("inputFolder", QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString());
 
     // 1. Проверяем, выбран ли конфиг
     if (ui->configComboBox->currentIndex() <= 0) {
@@ -599,7 +614,7 @@ void MainWindow::onStartClicked()
         fullPaths << inputDir.absoluteFilePath(fileName);
     }
 
-    QString outputFolder = settings.value("outputFolder", QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Results").toString();
+    QString outputFolder = m_appSettings.value("outputFolder", QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Results").toString();
     QDir outputDir(outputFolder);
     if (!outputDir.exists() && !outputDir.mkpath(".")) {
         QMessageBox::critical(this, "Ошибка", "Не удалось создать папку результатов:\n" + outputFolder);
@@ -661,7 +676,7 @@ void MainWindow::onStartClicked()
 
         if (!outPath.isEmpty()) {
             logMessage("Результат сохранён: " + outPath, false);
-            if (settings.value("autoOpenResultFolder", true).toBool()) {
+            if (m_appSettings.value("autoOpenResultFolder", true).toBool()) {
                 QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(outPath).absolutePath()));
             }
         }
@@ -680,6 +695,17 @@ void MainWindow::onStartClicked()
         // Поле ui->fileName НЕ ОЧИЩАЕМ. Функция просто завершает работу.
         // Движок сам перехватит управление и выполнит плагин по окончании pip.
     }
+    else if (result.value("isRunning").toBool()) {
+        // СЛУЧАЙ 2Б: .exe/.py запущен асинхронно и сейчас выполняется в фоне.
+        // Раньше этой ветки не было, потому что runConfig() блокировал этот же
+        // поток вплоть до 5 минут, пока скрипт не завершится. Теперь результат
+        // придет позже через сигнал pluginFinished -> onPluginFinished().
+        QString msg = result.value("error").toString();
+        logMessage(msg, false);
+
+        ui->startButton->setText("⚙️ Выполняется...");
+        // Поле ui->fileName НЕ ОЧИЩАЕМ до реального завершения — это сделает onPluginFinished().
+    }
     else {
         // СЛУЧАЙ 3: Обычная ошибка (не смогли загрузить плагин, упал EXE и т.д.)
         ui->startButton->setEnabled(true);
@@ -694,8 +720,7 @@ void MainWindow::onStartClicked()
 
 void MainWindow::onBrowseXlsxClicked()
 {
-    QSettings settings("FinWizard", "Settings");
-    QString inputFolder = settings.value("inputFolder", QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input").toString();
+    QString inputFolder = m_appSettings.value("inputFolder", QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input").toString();
 
     QDir inputDir(inputFolder);
     if (!inputDir.exists() && !inputDir.mkpath(".")) return;
@@ -703,13 +728,13 @@ void MainWindow::onBrowseXlsxClicked()
     // 1. Расширяем строку фильтра файлов для диалогового окна
     QStringList selectedFiles = QFileDialog::getOpenFileNames(
         this, "Выберите XLSX-файлы или Архивы таблиц",
-        settings.value("lastInputFolder").toString(),
+        m_appSettings.value("lastInputFolder").toString(),
         "Поддерживаемые файлы (*.xlsx *.xls *.zip *.tar *.tar.gz *.tgz)"
         );
 
     if (selectedFiles.isEmpty()) return;
 
-    settings.setValue("lastInputFolder", QFileInfo(selectedFiles.first()).absolutePath());
+    m_appSettings.setValue("lastInputFolder", QFileInfo(selectedFiles.first()).absolutePath());
 
     bool atLeastOneProcessed = false;
 
@@ -779,10 +804,9 @@ void MainWindow::onSettingsClicked()
     dlg.resize(650, 420);
 
     QVBoxLayout *mainLayout = new QVBoxLayout(&dlg);
-    QSettings settings("FinWizard", "Settings");
 
     QCheckBox *autoOpenCheck = new QCheckBox("Автоматически открывать папку с результатами", &dlg);
-    autoOpenCheck->setChecked(settings.value("autoOpenResultFolder", true).toBool());
+    autoOpenCheck->setChecked(m_appSettings.value("autoOpenResultFolder", true).toBool());
     mainLayout->addWidget(autoOpenCheck);
 
     // --- ОПРЕДЕЛЕНИЕ КОРРЕКТНЫХ ДЕФОЛТНЫХ ПУТЕЙ БЕЗ КИРИЛЛИЦЫ ДЛЯ WINDOWS ---
@@ -803,7 +827,7 @@ void MainWindow::onSettingsClicked()
     auto createPathRow = [&](const QString &label, const QString &key, const QString &def) {
         QHBoxLayout *row = new QHBoxLayout(); // Перейдет под управление mainLayout при addLayout
         row->addWidget(new QLabel(label, &dlg));
-        QLineEdit *edit = new QLineEdit(settings.value(key, def).toString(), &dlg);
+        QLineEdit *edit = new QLineEdit(m_appSettings.value(key, def).toString(), &dlg);
         QPushButton *btn = new QPushButton("Обзор", &dlg);
 
         connect(btn, &QPushButton::clicked, [&dlg, edit]() {
@@ -826,10 +850,10 @@ void MainWindow::onSettingsClicked()
 
     QPushButton *saveBtn = new QPushButton("Сохранить", &dlg);
     connect(saveBtn, &QPushButton::clicked, [&]() {
-        settings.setValue("autoOpenResultFolder", autoOpenCheck->isChecked());
-        settings.setValue("outputFolder", resultEdit->text());
-        settings.setValue("inputFolder", inputEdit->text());
-        settings.setValue("cache/path", cacheEdit->text());
+        m_appSettings.setValue("autoOpenResultFolder", autoOpenCheck->isChecked());
+        m_appSettings.setValue("outputFolder", resultEdit->text());
+        m_appSettings.setValue("inputFolder", inputEdit->text());
+        m_appSettings.setValue("cache/path", cacheEdit->text());
 
         m_pluginManager->setCacheBasePath(cacheEdit->text());
 
@@ -861,11 +885,10 @@ void MainWindow::onSettingsClicked()
 
 void MainWindow::onDirectoryChanged(const QString &path)
 {
-    QSettings settings("FinWizard", "Settings");
 
     // Получаем текущие пути из настроек (очищаем их от лишних слешей для точного сравнения)
-    QString configsPath = QDir::cleanPath(settings.value("cache/path").toString());
-    QString inputPath = QDir::cleanPath(settings.value("inputFolder").toString());
+    QString configsPath = QDir::cleanPath(m_appSettings.value("cache/path").toString());
+    QString inputPath = QDir::cleanPath(m_appSettings.value("inputFolder").toString());
     QString changedPath = QDir::cleanPath(path);
 
     if (changedPath == configsPath) {
@@ -884,11 +907,10 @@ void MainWindow::onDirectoryChanged(const QString &path)
 void MainWindow::updateXlsxList()
 {
     ui->xlsxList->clear();
-    QSettings settings("FinWizard", "Settings");
 
     // Получаем правильный дефолтный путь, точно так же, как в конструкторе
     QString defaultInput = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input";
-    QString inputFolderPath = settings.value("inputFolder", defaultInput).toString();
+    QString inputFolderPath = m_appSettings.value("inputFolder", defaultInput).toString();
 
     QDir inputDir(inputFolderPath);
 
@@ -1077,8 +1099,7 @@ void MainWindow::logMessage(const QString &message, bool isError)
 
 void MainWindow::onOpenFolderClicked()
 {
-    QSettings settings("FinWizard", "Settings");
-    QDesktopServices::openUrl(QUrl::fromLocalFile(settings.value("cache/path").toString()));
+    QDesktopServices::openUrl(QUrl::fromLocalFile(m_appSettings.value("cache/path").toString()));
 }
 
 // Сюда прилетает живой выхлоп от pip install
@@ -1125,8 +1146,7 @@ void MainWindow::onPluginFinished(int id, bool success, const QString &message, 
         if (!outputPath.isEmpty()) {
             logMessage("Результат сохранён: " + outputPath, false);
 
-            QSettings settings("FinWizard", "Settings");
-            if (settings.value("autoOpenResultFolder", true).toBool()) {
+            if (m_appSettings.value("autoOpenResultFolder", true).toBool()) {
                 QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(outputPath).absolutePath()));
             }
         }
@@ -1173,14 +1193,13 @@ void MainWindow::changeEvent(QEvent *event)
 
 void MainWindow::onOpenXlsxFolderClicked()
 {
-    QSettings settings("FinWizard", "Settings");
     // Берем путь из настроек, если его нет — дефолтный Documents
-    QString inputFolderPath = settings.value("inputFolder",
-                                             QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString();
+    QString inputFolderPath = m_appSettings.value("inputFolder",
+                                                  QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString();
 
-        QDir inputDir(inputFolderPath);
-        // Если папки почему-то нет физически, создадим её, чтобы проводник не ругался
-        if (!inputDir.exists()) {
+    QDir inputDir(inputFolderPath);
+    // Если папки почему-то нет физически, создадим её, чтобы проводник не ругался
+    if (!inputDir.exists()) {
         if (!inputDir.mkpath(".")) {
             logMessage("Не удалось создать или открыть папку: " + inputFolderPath, true);
             return;
@@ -1200,9 +1219,9 @@ void MainWindow::updateInterfaceIcons()
     // Проверяем текущую тему (светлая/темная)
     bool isDark = ui->centralwidget->palette().color(QPalette::Window).value() < 128;
 
-        // Если тема ТЕМНАЯ — оставляем иконки белыми.
-        // Если СВЕТЛАЯ — превращаем их в темно-серый/черный (#2c3e50), чтобы они были контрастными.
-        QColor iconColor = isDark ? QColor(Qt::white) : QColor("#2c3e50");
+    // Если тема ТЕМНАЯ — оставляем иконки белыми.
+    // Если СВЕТЛАЯ — превращаем их в темно-серый/черный (#2c3e50), чтобы они были контрастными.
+    QColor iconColor = isDark ? QColor(Qt::white) : QColor("#2c3e50");
 
     auto getTintedIcon = [&](const QString &resourcePath) -> QIcon {
         QImage img(resourcePath);

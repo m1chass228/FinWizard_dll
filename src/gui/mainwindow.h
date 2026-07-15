@@ -5,6 +5,7 @@
 #include "finwizard/pluginrepository.h"
 #include "ui_mainwindow.h"
 #include <QFileSystemWatcher>
+#include <QSettings>
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
@@ -50,6 +51,7 @@ private slots:
 private:
     PluginManager *m_pluginManager;
     QString m_currentXlsxPath;                // путь к выбранному XLSX-файлу
+    QSettings m_appSettings{"FinWizard", "Settings"}; // Единый экземпляр вместо пересоздания в каждом методе
     QFileSystemWatcher *m_watcher;
     QTimer *m_watchdogTimer;
     Ui::MainWindow *ui;
