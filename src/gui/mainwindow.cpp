@@ -37,7 +37,7 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
 
     setAcceptDrops(true);
 
-    setWindowTitle("FinWizard dll v1.4.1");
+    setWindowTitle("FinWizard dll v1.5.1");
     setWindowIcon(QIcon(":/res/f_icon.svg"));
 
     if (!m_pluginManager) {
@@ -226,6 +226,7 @@ void MainWindow::setupConnections()
     connect(m_pluginManager, &PluginManager::pluginFinished, this, &MainWindow::onPluginFinished);
     connect(ui->openXlsxFolderButton, &QPushButton::clicked, this, &MainWindow::onOpenXlsxFolderClicked);
     connect(ui->refreshXlsxButton, &QPushButton::clicked, this, &MainWindow::updateXlsxList);
+    connect(ui->clearInputDirButton, &QPushButton::clicked, this, &MainWindow::onClearInputDirButton);
 
     // --- 5. ПОДПИСКА НА СИГНАЛЫ ДВИЖКА (через менеджер) ---
     connect(m_pluginManager, &PluginManager::pluginLogReceived, this, &MainWindow::onPluginLogReceived);
@@ -716,6 +717,64 @@ void MainWindow::onStartClicked()
         logMessage("Ошибка: " + error, true);
         QMessageBox::critical(this, "Ошибка выполнения", error);
     }
+}
+
+void MainWindow::onClearInputDirButton()
+{
+    QString inputFolder = m_appSettings.value("inputFolder",
+                                              QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input").toString();
+
+    QDir inputDir(inputFolder);
+    if (!inputDir.exists() && !inputDir.mkpath(".")) return;
+
+    // 1. ОКНО ПОДТВЕРЖДЕНИЯ
+    QMessageBox::StandardButton reply;
+    reply = QMessageBox::question(this,
+                                  "Подтверждение удаления",
+                                  "Вы уверены, что хотите полностью очистить папку?\n"
+                                  "Все файлы Excel в этой директории и поддиректориях будут безвозвратно удалены.",
+                                  QMessageBox::Yes | QMessageBox::No,
+                                  QMessageBox::No); // Кнопка по умолчанию (выделенная) — No для безопасности
+
+    // Если пользователь передумал или закрыл окно — выходим
+    if (reply != QMessageBox::Yes) {
+        logMessage("Очистка папки отменена пользователем.", true);
+        return;
+    }
+
+    // Список расширений Excel (без точек, так как suffix() возвращает расширение без точки)
+    QStringList excelExtensions = {"xls", "xlsx", "xlsm", "xlsb"};
+
+    QDirIterator it(inputFolder, QDir::Files | QDir::NoSymLinks, QDirIterator::Subdirectories);
+    int deletedCount = 0;
+    int failedCount = 0;
+
+    while (it.hasNext()) {
+        it.next();
+
+        // Разгружаем GUI, чтобы окно приложения не зависало при проверке сотен файлов
+        QCoreApplication::processEvents();
+
+        QString filePath = it.filePath();
+        // Используем суффикс без complete, чтобы избежать проблем с точками в именах файлов
+        QString fileExtension = it.fileInfo().suffix().toLower();
+
+        if (excelExtensions.contains(fileExtension)) {
+            QFile file(filePath);
+            if (file.remove()) {
+                logMessage("Файл удален: " + filePath, true);
+                deletedCount++;
+            } else {
+                logMessage("Не удалось удалить файл: " + filePath + " (" + file.errorString() + ")", false);
+                failedCount++;
+            }
+        }
+    }
+
+    updateXlsxList();
+
+    // Итоговое уведомление в лог
+    logMessage(QString("Очистка завершена. Удалено файлов: %1, ошибок: %2").arg(deletedCount).arg(failedCount), true);
 }
 
 void MainWindow::onBrowseXlsxClicked()

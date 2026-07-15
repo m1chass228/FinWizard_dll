@@ -47,6 +47,7 @@ private slots:
     void onPluginReadyChanged(int id, bool success);
     void updateInterfaceIcons();
     void onDeleteConfigClicked();
+    void onClearInputDirButton();
 
 private:
     PluginManager *m_pluginManager;

@@ -47,6 +47,8 @@ private:
 
     bool startExternalProcessAsync(const CachedConfig &cfg, const QVariantMap &params, QString &startupError);
 
+    bool isVenvValid(const QString &cachePath, const QString &currentBasePython) const;
+
     std::map<int, std::unique_ptr<QPluginLoader>> m_loaders;
     std::map<int, IConfig*> m_activeConfigs;
 

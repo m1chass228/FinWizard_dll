@@ -2,7 +2,7 @@
 #define MySourceDir "C:\Projects\FinWizard_dll-main\build\Desktop_Qt_6_11_1_MinGW_64_bit_Release\src\gui"
 
 #define MyAppName "FinWizard"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.5"
 #define MyAppExeName "FinWizardGui.exe"
 #define MyAppPublisher "FinWizard Creator"
 
