@@ -37,7 +37,7 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
 
     setAcceptDrops(true);
 
-    setWindowTitle("FinWizard dll v1.2.1");
+    setWindowTitle("FinWizard dll v1.4.1");
     setWindowIcon(QIcon(":/res/f_icon.svg"));
 
     if (!m_pluginManager) {
