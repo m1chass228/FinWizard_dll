@@ -1,0 +1,28 @@
+<svg aria-labelledby="title desc" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" height="512" width="512">
+  <title>Professional F Logo</title>
+  <desc id="desc">Серьёзная иконка с буквой F для приложения</desc>
+  
+  <defs>
+    <linearGradient y2="100%" x2="0%" y1="0%" x1="0%" id="bgGrad">
+      <stop stop-color="#1F2937" offset="0%"></stop>
+      <stop stop-color="#111827" offset="100%"></stop>
+    </linearGradient>
+    
+    <linearGradient y2="90%" x2="70%" y1="20%" x1="30%" id="fGrad">
+      <stop stop-color="#F1F5F9" offset="0%"></stop>
+      <stop stop-color="#CBD5E1" offset="100%"></stop>
+    </linearGradient>
+  </defs>
+
+  
+  <rect fill="url(#bgGrad)" rx="80" height="512" width="512"></rect>
+  
+  
+  <rect opacity="0.6" stroke-width="18" stroke="#64748B" fill="none" rx="65" height="456" width="456" y="28" x="28"></rect>
+
+  
+  <text paint-order="stroke fill" stroke-width="28" stroke="#0F172A" fill="url(#fGrad)" text-anchor="middle" font-weight="900" font-size="285" font-family="'Helvetica', 'Arial Black', sans-serif" y="335" x="256">F</text>
+
+  
+  <rect fill="#94A3B8" rx="7" height="14" width="256" y="385" x="128"></rect>
+</svg>
