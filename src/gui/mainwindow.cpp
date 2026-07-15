@@ -1304,4 +1304,5 @@ void MainWindow::updateInterfaceIcons()
     ui->openXlsxFolderButton->setIcon(getTintedIcon(":/res/folder_open_google.svg"));
     ui->refreshXlsxButton->setIcon(getTintedIcon(":/res/refresh_google.svg"));
     ui->settingsButton->setIcon(getTintedIcon(":/res/settings_google.svg"));
+    ui->clearInputDirButton->setIcon(getTintedIcon(":/res/trash_google.svg"));
 }
