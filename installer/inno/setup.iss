@@ -11,14 +11,25 @@
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+
+; {autopf} автоматически выберет:
+; - "C:\Program Files (x86)\FinWizard" (если запуск от админа)
+; - "C:\Users\Имя\AppData\Local\Programs\FinWizard" (если запуск без прав админа)
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir={#MyOutDir}
 OutputBaseFilename=FinWizard_Setup
 Compression=lzma2
 SolidCompression=yes
-; Позволяет устанавливать программу даже без прав Администратора!
-PrivilegesRequired=admin
+
+; --- РЕШЕНИЕ ПРОБЛЕМЫ С ПРАВАМИ АДМИНИСТРАТОРА ---
+; adminorlowest: пытается получить права админа, но если пользователь отказывается или у него их нет —
+; спокойно устанавливает программу в пользовательскую папку AppData без запроса UAC.
+PrivilegesRequired=adminorlowest
+
+; Показывает диалог выбора: "Установить для всех пользователей" или "Установить только для меня"
+PrivilegesRequiredOverridesAllowed=dialog
+
 ; Иконка для удаления программы в панели управления
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
