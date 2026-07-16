@@ -45,11 +45,13 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
         return;
     }
 
-    // Кнопка выключена, пока не выбран конфиг
-    //ui->startButton->setEnabled(false);
-
     // Включаем поддержку HTML тегов, так как acceptRichText в .ui выключен
     ui->logTextEdit->setAcceptRichText(true);
+
+    // Консоль — это для гиков: по умолчанию прячем, показываем только если
+    // юзер явно включил её в настройках. Логи при этом продолжают копиться
+    // в фоне, ничего не теряется — просто не отображается, пока не откроют.
+    ui->logTextEdit->setVisible(m_appSettings.value("ui/showConsole", false).toBool());
 
     logMessage("Программа запущена. Конфиги загружены из кэша.", false);
 
@@ -239,10 +241,10 @@ void MainWindow::setupConnections()
 // Вспомогательный метод для очистки стилей
 void MainWindow::clearHoverStyles()
 {
-    if (ui->configComboBox->property("dragHover").toBool() == true) {
-        ui->configComboBox->setProperty("dragHover", false);
-        ui->configComboBox->style()->unpolish(ui->configComboBox);
-        ui->configComboBox->style()->polish(ui->configComboBox);
+    if (ui->pluginDropZone->property("dragHover").toBool() == true) {
+        ui->pluginDropZone->setProperty("dragHover", false);
+        ui->pluginDropZone->style()->unpolish(ui->pluginDropZone);
+        ui->pluginDropZone->style()->polish(ui->pluginDropZone);
     }
     if (ui->xlsxList->property("dragHover").toBool() == true) {
         ui->xlsxList->setProperty("dragHover", false);
@@ -269,27 +271,39 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
         return;
     }
 
-    // ИСПРАВЛЕНИЕ КООРДИНАТ: переводим точку окна в локальные координаты каждого виджета
+    // ИСПРАВЛЕНИЕ КООРДИНАТ: переводим точку окна в локальные координаты каждого виджета.
+    // Зона плагинов теперь — это весь pluginDropZone (иконка, имя, описание, кнопка папки),
+    // а не только свернутый configComboBox, в который было тяжело попасть мышью.
     QPoint windowPos = event->position().toPoint();
-    QPoint localComboPos = ui->configComboBox->mapFrom(this, windowPos);
+    QPoint localDropZonePos = ui->pluginDropZone->mapFrom(this, windowPos);
     QPoint localXlsxPos  = ui->xlsxList->mapFrom(this, windowPos);
 
-    QString filePath = event->mimeData()->urls().first().toLocalFile();
-    QFileInfo fi(filePath);
-    QString ext = fi.suffix().toLower();
-    QString compExt = fi.completeSuffix().toLower();
+    // ВАЖНО: смотрим на ВСЕ перетаскиваемые файлы, а не только на urls().first().
+    // Раньше, если тащили разом архив плагина и xlsx-файл, тип определялся только
+    // по первому файлу в списке — и если он оказывался "не тем", зона подсветки
+    // могла вообще не активироваться, хотя часть файлов в drag'е была валидной.
+    bool hasPluginArchive = false;
+    bool hasExcelFile = false;
+    for (const QUrl &url : event->mimeData()->urls()) {
+        QFileInfo fi(url.toLocalFile());
+        QString ext = fi.suffix().toLower();
+        QString compExt = fi.completeSuffix().toLower();
+        if (ext == "zip" || ext == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz")) {
+            hasPluginArchive = true;
+        }
+        if (ext == "xlsx" || ext == "xls") {
+            hasExcelFile = true;
+        }
+    }
 
-    bool isValidPluginArchive = (ext == "zip" || ext == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz"));
-    bool isValidExcelFile     = (ext == "xlsx" || ext == "xls");
-
-    // ПРОВЕРКА ЗОНЫ ПЛАГИНОВ (configComboBox)
-    if (ui->configComboBox->rect().contains(localComboPos)) {
-        if (isValidPluginArchive) {
+    // ПРОВЕРКА ЗОНЫ ПЛАГИНОВ (весь pluginDropZone)
+    if (ui->pluginDropZone->rect().contains(localDropZonePos)) {
+        if (hasPluginArchive) {
             // ИСПРАВЛЕНИЕ UX: Используем свойства вместо тяжелого setStyleSheet
-            if (ui->configComboBox->property("dragHover").toBool() != true) {
-                ui->configComboBox->setProperty("dragHover", true);
-                ui->configComboBox->style()->unpolish(ui->configComboBox);
-                ui->configComboBox->style()->polish(ui->configComboBox);
+            if (ui->pluginDropZone->property("dragHover").toBool() != true) {
+                ui->pluginDropZone->setProperty("dragHover", true);
+                ui->pluginDropZone->style()->unpolish(ui->pluginDropZone);
+                ui->pluginDropZone->style()->polish(ui->pluginDropZone);
             }
             // Гасим подсветку у соседа
             if (ui->xlsxList->property("dragHover").toBool() != false) {
@@ -303,16 +317,16 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
     }
     // ПРОВЕРКА ЗОНЫ XLSX ТАБЛИЦ (xlsxList)
     else if (ui->xlsxList->rect().contains(localXlsxPos)) {
-        if (isValidExcelFile || isValidPluginArchive) {
+        if (hasExcelFile || hasPluginArchive) {
             if (ui->xlsxList->property("dragHover").toBool() != true) {
                 ui->xlsxList->setProperty("dragHover", true); // Свойство dragHover активируется таблицей стилей из main.cpp
                 ui->xlsxList->style()->unpolish(ui->xlsxList);
                 ui->xlsxList->style()->polish(ui->xlsxList);
             }
-            if (ui->configComboBox->property("dragHover").toBool() != false) {
-                ui->configComboBox->setProperty("dragHover", false);
-                ui->configComboBox->style()->unpolish(ui->configComboBox);
-                ui->configComboBox->style()->polish(ui->configComboBox);
+            if (ui->pluginDropZone->property("dragHover").toBool() != false) {
+                ui->pluginDropZone->setProperty("dragHover", false);
+                ui->pluginDropZone->style()->unpolish(ui->pluginDropZone);
+                ui->pluginDropZone->style()->polish(ui->pluginDropZone);
             }
             event->acceptProposedAction();
             return;
@@ -320,7 +334,7 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
     }
 
     // Если курсор не попал ни в одну зону или файл не того формата — сбрасываем стили
-    if (ui->configComboBox->property("dragHover").toBool() == true ||
+    if (ui->pluginDropZone->property("dragHover").toBool() == true ||
         ui->xlsxList->property("dragHover").toBool() == true)
     {
         clearHoverStyles();
@@ -347,22 +361,30 @@ void MainWindow::dropEvent(QDropEvent *event)
 
     // ИСПРАВЛЕНИЕ КООРДИНАТ
     QPoint windowPos = event->position().toPoint();
-    QPoint localComboPos = ui->configComboBox->mapFrom(this, windowPos);
+    QPoint localDropZonePos = ui->pluginDropZone->mapFrom(this, windowPos);
     QPoint localXlsxPos  = ui->xlsxList->mapFrom(this, windowPos);
 
     QList<QUrl> urls = event->mimeData()->urls();
-    QString filePath = urls.first().toLocalFile();
-    QFileInfo fi(filePath);
-    QString ext = fi.suffix().toLower();
-    QString compExt = fi.completeSuffix().toLower();
 
-    bool isArchive = (ext == "zip" || ext == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz"));
+    // Как и в dragMoveEvent: смотрим на ВСЕ файлы, а не только на urls.first().
+    // Раньше, если первым в drag'е шел xlsx, а архив плагина — вторым, вся зона
+    // плагинов сразу отбивалась ошибкой "не архив", хотя валидный архив там был.
+    bool hasAnyArchive = false;
+    for (const QUrl &url : urls) {
+        QFileInfo curFi(url.toLocalFile());
+        QString curExt = curFi.suffix().toLower();
+        QString curCompExt = curFi.completeSuffix().toLower();
+        if (curExt == "zip" || curExt == "tar" || curCompExt.endsWith("tar.gz") || curCompExt.endsWith("tgz")) {
+            hasAnyArchive = true;
+            break;
+        }
+    }
 
     // ========================================================================
-    // ОБРАБОТКА: ЗОНА ПЛАГИНОВ (configComboBox)
+    // ОБРАБОТКА: ЗОНА ПЛАГИНОВ (весь pluginDropZone)
     // ========================================================================
-    if (ui->configComboBox->rect().contains(localComboPos)) {
-        if (!isArchive) {
+    if (ui->pluginDropZone->rect().contains(localDropZonePos)) {
+        if (!hasAnyArchive) {
             logMessage("Ошибка: В зону плагинов можно сбрасывать только архивы (ZIP, TAR, TAR.GZ)!", true);
             QMessageBox::critical(this, "Неверный формат", "Сюда можно сбрасывать только файлы плагинов в формате архивов (.zip, .tar, .tar.gz)!");
             event->ignore();
@@ -868,6 +890,10 @@ void MainWindow::onSettingsClicked()
     autoOpenCheck->setChecked(m_appSettings.value("autoOpenResultFolder", true).toBool());
     mainLayout->addWidget(autoOpenCheck);
 
+    QCheckBox *showConsoleCheck = new QCheckBox("Показывать консоль (логи выполнения)", &dlg);
+    showConsoleCheck->setChecked(m_appSettings.value("ui/showConsole", false).toBool());
+    mainLayout->addWidget(showConsoleCheck);
+
     // --- ОПРЕДЕЛЕНИЕ КОРРЕКТНЫХ ДЕФОЛТНЫХ ПУТЕЙ БЕЗ КИРИЛЛИЦЫ ДЛЯ WINDOWS ---
     QString defaultCachePath;
     QString defaultInputPath;
@@ -910,6 +936,8 @@ void MainWindow::onSettingsClicked()
     QPushButton *saveBtn = new QPushButton("Сохранить", &dlg);
     connect(saveBtn, &QPushButton::clicked, [&]() {
         m_appSettings.setValue("autoOpenResultFolder", autoOpenCheck->isChecked());
+        m_appSettings.setValue("ui/showConsole", showConsoleCheck->isChecked());
+        ui->logTextEdit->setVisible(showConsoleCheck->isChecked());
         m_appSettings.setValue("outputFolder", resultEdit->text());
         m_appSettings.setValue("inputFolder", inputEdit->text());
         m_appSettings.setValue("cache/path", cacheEdit->text());
