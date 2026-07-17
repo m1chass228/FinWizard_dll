@@ -5,11 +5,41 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QFile>
+#include <QFileInfo>
 #include <QDir>
 #include <QCoreApplication>
 #include <QStandardPaths>
 #include <QJsonArray>
 #include <QSettings>
+
+namespace {
+// ИСПРАВЛЕНИЕ "Module use of pythonXXX.dll conflicts with this version of Python":
+// раньше все QProcess'ы (создание venv, pip install, запуск скрипта) наследовали
+// голый QProcessEnvironment::systemEnvironment() как есть. Если в PATH пользователя
+// раньше нашего портативного интерпретатора стоит ДРУГАЯ установка Python той же
+// мажорной версии (Anaconda, Python из Microsoft Store, ещё один локальный питон —
+// у Марии явно так и есть), загрузчик Windows при старте venv-python.exe резолвит
+// pythonXYZ.dll не из папки НАШЕГО интерпретатора, а находит чужую одноимённую DLL
+// раньше по PATH. Дальше любой C-extension модуль (обычно первым падает _socket/_ssl,
+// как в логе) падает с этим ImportError, потому что скомпилирован под другую сборку.
+// Фикс: прописываем директорию интерпретатора, который мы реально запускаем, в
+// начало PATH — тогда её DLL находится первой, конфликт невозможен.
+QProcessEnvironment buildIsolatedPythonEnv(const QString &pythonExePath)
+{
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+#ifdef Q_OS_WIN
+    env.insert("PYTHONIOENCODING", "utf-8");
+    env.insert("PYTHONUTF8", "1");
+
+    QString pythonDir = QDir::toNativeSeparators(QFileInfo(pythonExePath).absolutePath());
+    if (!pythonDir.isEmpty()) {
+        QString oldPath = env.value("PATH");
+        env.insert("PATH", pythonDir + ";" + oldPath);
+    }
+#endif
+    return env;
+}
+} // namespace
 
 PluginEngine::PluginEngine(QObject *parent)
     : QObject(parent), m_pipProcess(nullptr), m_isWaitingForPip(false)
@@ -152,12 +182,7 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
     infoLogRequested("[ДВИЖОК] Создаю чистое виртуальное окружение venv из: " + nativeBasePython);
 
     QProcess createVenv;
-#ifdef Q_OS_WIN
-    QProcessEnvironment venvEnv = QProcessEnvironment::systemEnvironment();
-    venvEnv.insert("PYTHONIOENCODING", "utf-8");
-    venvEnv.insert("PYTHONUTF8", "1");
-    createVenv.setProcessEnvironment(venvEnv);
-#endif
+    createVenv.setProcessEnvironment(buildIsolatedPythonEnv(nativeBasePython));
 
     // Попытка №1: Используем стандартный модуль venv
     createVenv.start(nativeBasePython, QStringList() << "-m" << "venv" << nativeVenvPath);
@@ -210,12 +235,7 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
     m_pipProcess = new QProcess(this);
     QProcess* proc = m_pipProcess;
 
-#ifdef Q_OS_WIN
-    QProcessEnvironment pipEnv = QProcessEnvironment::systemEnvironment();
-    pipEnv.insert("PYTHONIOENCODING", "utf-8");
-    pipEnv.insert("PYTHONUTF8", "1");
-    proc->setProcessEnvironment(pipEnv);
-#endif
+    proc->setProcessEnvironment(buildIsolatedPythonEnv(nativeVenvPython));
 
     QStringList pipArgs;
     pipArgs << "-m" << "pip" << "install" << "-r" << nativeReqPath;
@@ -528,12 +548,7 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
 
     qInfo() << "Запуск внешнего процесса (асинхронно):" << program << args;
 
-#ifdef Q_OS_WIN
-    QProcessEnvironment scriptEnv = QProcessEnvironment::systemEnvironment();
-    scriptEnv.insert("PYTHONIOENCODING", "utf-8");
-    scriptEnv.insert("PYTHONUTF8", "1");
-    proc->setProcessEnvironment(scriptEnv);
-#endif
+    proc->setProcessEnvironment(buildIsolatedPythonEnv(program));
 
     // Локальные копии данных из cfg для безопасного захвата по значению в лямбды
     const int cfgId = cfg.id;
@@ -773,15 +788,11 @@ bool PluginEngine::isVenvValid(const QString &cachePath, const QString &currentB
     }
 
     // 2. Тест работоспособности pip
+    QString nativeVenvPythonCheck = QDir::toNativeSeparators(venvPython);
     QProcess testProc;
-#ifdef Q_OS_WIN
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    env.insert("PYTHONIOENCODING", "utf-8");
-    env.insert("PYTHONUTF8", "1");
-    testProc.setProcessEnvironment(env);
-#endif
+    testProc.setProcessEnvironment(buildIsolatedPythonEnv(nativeVenvPythonCheck));
 
-    testProc.start(QDir::toNativeSeparators(venvPython), QStringList() << "-m" << "pip" << "--version");
+    testProc.start(nativeVenvPythonCheck, QStringList() << "-m" << "pip" << "--version");
     if (!testProc.waitForFinished(4000) || testProc.exitCode() != 0) {
         PluginEngine* mutableThis = const_cast<PluginEngine*>(this);
         mutableThis->infoLogRequested("[VENV VALID] Тестовый запуск pip внутри venv завершился с ошибкой!");

@@ -260,7 +260,7 @@ void MainWindow::setupWidgets()
     // в QSS не существует (это чистый CSS), Qt Style Sheets его не поддерживают и
     // молча ругаются в консоли ("Unknown property cursor"), ничего не применяя.
     const QList<QPushButton*> clickableButtons = {
-        ui->startButton, ui->settingsButton, ui->openFolderButton,
+        ui->startButton, ui->settingsButton, ui->openFolderButton, ui->deleteConfigButton,
         ui->browseXlsxButton, ui->openXlsxFolderButton,
         ui->clearInputDirButton, ui->refreshXlsxButton
     };
@@ -276,11 +276,21 @@ void MainWindow::setupWidgets()
     QListView* popupListView = qobject_cast<QListView*>(ui->configComboBox->view());
     if (popupListView) {
         popupListView->setMouseTracking(true);
+
+        // ИСПРАВЛЕНИЕ "ПРИЗРАЧНОГО БЕЛОГО КВАДРАТА" ПРИ НАВЕДЕНИИ: у заглушки
+        // ("Выберите конфиг...") и пункта "Добавить конфиг..." курсивный шрифт,
+        // отличный от обычных строк. Без uniform item sizes Qt пересчитывает
+        // высоту каждой строки индивидуально и может рассинхронизировать
+        // прямоугольник hover-подсветки с реальной позицией текста — на экране
+        // это выглядит как пустой белый блок не на своем месте. Форсируем единую
+        // высоту строки на весь список — рассинхрон становится невозможен.
+        popupListView->setUniformItemSizes(true);
+
         popupListView->setStyleSheet(
             // Убрал border-bottom между айтемами — в попапе это читалось как отдельные
             // "рамки" вокруг каждой строчки. Разделение теперь только через padding и hover.
             "QListView::item { padding: 8px; }"
-            "QListView::item:hover { background-color: rgba(46, 204, 113, 0.15); }" // Тот же зелёный акцент, что и в остальном QSS
+            "QListView::item:hover { background-color: rgba(46, 204, 113, 0.15); color: palette(text); }" // Явно фиксируем цвет текста — иначе Fusion на hover подменяет его на белый (highlighted-text), и на светлой теме текст становится невидимым
             );
     }
 
@@ -371,6 +381,7 @@ void MainWindow::setupConnections()
     connect(ui->configComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::onConfigSelected);
     connect(ui->browseXlsxButton, &QPushButton::clicked, this, &MainWindow::onBrowseXlsxClicked);
     connect(ui->openFolderButton, &QPushButton::clicked, this, &MainWindow::onOpenFolderClicked);
+    connect(ui->deleteConfigButton, &QPushButton::clicked, this, &MainWindow::onDeleteConfigClicked);
     connect(ui->startButton, &QPushButton::clicked, this, &MainWindow::onStartClicked);
     connect(ui->settingsButton, &QPushButton::clicked, this, &MainWindow::onSettingsClicked);
     connect(m_pluginManager, &PluginManager::pluginFinished, this, &MainWindow::onPluginFinished);
