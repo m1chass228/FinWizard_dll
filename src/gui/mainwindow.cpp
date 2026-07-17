@@ -260,7 +260,7 @@ void MainWindow::setupWidgets()
     // в QSS не существует (это чистый CSS), Qt Style Sheets его не поддерживают и
     // молча ругаются в консоли ("Unknown property cursor"), ничего не применяя.
     const QList<QPushButton*> clickableButtons = {
-        ui->startButton, ui->settingsButton, ui->openFolderButton,
+        ui->startButton, ui->settingsButton, ui->openFolderButton, ui->deleteConfigButton,
         ui->browseXlsxButton, ui->openXlsxFolderButton,
         ui->clearInputDirButton, ui->refreshXlsxButton
     };
@@ -381,6 +381,7 @@ void MainWindow::setupConnections()
     connect(ui->configComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::onConfigSelected);
     connect(ui->browseXlsxButton, &QPushButton::clicked, this, &MainWindow::onBrowseXlsxClicked);
     connect(ui->openFolderButton, &QPushButton::clicked, this, &MainWindow::onOpenFolderClicked);
+    connect(ui->deleteConfigButton, &QPushButton::clicked, this, &MainWindow::onDeleteConfigClicked);
     connect(ui->startButton, &QPushButton::clicked, this, &MainWindow::onStartClicked);
     connect(ui->settingsButton, &QPushButton::clicked, this, &MainWindow::onSettingsClicked);
     connect(m_pluginManager, &PluginManager::pluginFinished, this, &MainWindow::onPluginFinished);
