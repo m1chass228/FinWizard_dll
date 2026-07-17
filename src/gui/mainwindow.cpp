@@ -276,11 +276,21 @@ void MainWindow::setupWidgets()
     QListView* popupListView = qobject_cast<QListView*>(ui->configComboBox->view());
     if (popupListView) {
         popupListView->setMouseTracking(true);
+
+        // ИСПРАВЛЕНИЕ "ПРИЗРАЧНОГО БЕЛОГО КВАДРАТА" ПРИ НАВЕДЕНИИ: у заглушки
+        // ("Выберите конфиг...") и пункта "Добавить конфиг..." курсивный шрифт,
+        // отличный от обычных строк. Без uniform item sizes Qt пересчитывает
+        // высоту каждой строки индивидуально и может рассинхронизировать
+        // прямоугольник hover-подсветки с реальной позицией текста — на экране
+        // это выглядит как пустой белый блок не на своем месте. Форсируем единую
+        // высоту строки на весь список — рассинхрон становится невозможен.
+        popupListView->setUniformItemSizes(true);
+
         popupListView->setStyleSheet(
             // Убрал border-bottom между айтемами — в попапе это читалось как отдельные
             // "рамки" вокруг каждой строчки. Разделение теперь только через padding и hover.
             "QListView::item { padding: 8px; }"
-            "QListView::item:hover { background-color: rgba(46, 204, 113, 0.15); }" // Тот же зелёный акцент, что и в остальном QSS
+            "QListView::item:hover { background-color: rgba(46, 204, 113, 0.15); color: palette(text); }" // Явно фиксируем цвет текста — иначе Fusion на hover подменяет его на белый (highlighted-text), и на светлой теме текст становится невидимым
             );
     }
 

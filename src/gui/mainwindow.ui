@@ -350,7 +350,11 @@
        </spacer>
       </item>
       <item>
-       <widget class="QLineEdit" name="fileName"/>
+       <widget class="QLineEdit" name="fileName">
+        <property name="placeholderText">
+         <string>Введите название выходного файла...</string>
+        </property>
+       </widget>
       </item>
       <item>
        <widget class="QFrame" name="frame">
