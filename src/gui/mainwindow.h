@@ -28,6 +28,7 @@ protected:
     void dropEvent(QDropEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
     void changeEvent(QEvent *event) override;
+    bool eventFilter(QObject *obj, QEvent *event) override;
 
 private slots:
     void updateConfigList();                  // обновить список конфигов в configComboBox
@@ -74,6 +75,13 @@ private:
     void setupWidgets();
     void setupConnections();
     void setupCoreComponents();
+
+    void applyShadow(QWidget* w, bool isDark = false);
+    void fadeIn(QWidget* w);
+    void setupModernComboBox(QComboBox* combo, bool isDark = false);
+    void animateButtonHover(QPushButton* btn);
+    void animateHoverEnter(QWidget* w);
+    void animateHoverLeave(QWidget* w);
 
     QString m_configsPath;
     QString m_inputPath;

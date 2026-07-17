@@ -27,6 +27,136 @@
 #include <QPainter>
 #include <QMimeData>
 #include <QUrl>
+#include <QPropertyAnimation>
+#include <QGraphicsOpacityEffect>
+#include <QGraphicsDropShadowEffect>
+#include <QListView>
+#include <QComboBox>
+#include <QAbstractAnimation>
+
+#include <QGraphicsEffect>
+#include <QListWidgetItem>
+#include <QFont>
+#include <QBrush>
+
+void MainWindow::fadeIn(QWidget* w)
+{
+    if (!w) return;
+    auto effect = new QGraphicsOpacityEffect(w);
+    w->setGraphicsEffect(effect);
+
+    auto anim = new QPropertyAnimation(effect, "opacity");
+    anim->setDuration(300);
+    anim->setStartValue(0.0);
+    anim->setEndValue(1.0);
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
+}
+
+void MainWindow::applyShadow(QWidget* w, bool isDark)
+{
+    if (!w) return;
+    auto shadow = new QGraphicsDropShadowEffect(w);
+    shadow->setBlurRadius(25);
+    shadow->setOffset(0, 6);
+
+    if (isDark) {
+        shadow->setColor(QColor(0, 0, 0, 80));
+    } else {
+        shadow->setColor(QColor(0, 0, 0, 120));
+    }
+
+    w->setGraphicsEffect(shadow);
+}
+
+void MainWindow::setupModernComboBox(QComboBox* combo, bool isDark)
+{
+    if (!combo) return;
+
+    // ИСПРАВЛЕНИЕ БАГА "СЛОМАННЫЙ СПИСОК ПЛАГИНОВ": раньше здесь подменяли view()
+    // комбобокса на новый QListView и выставляли ему Qt::Popup | Qt::FramelessWindowHint.
+    // Это ломает попап QComboBox на живую — то схлопывается в 0 высоты, то не рисует
+    // айтемы, то не закрывается по клику мимо — поведение зависит от стиля/ОС и крайне
+    // нестабильно. Надежный способ стилизовать выпадающий список — чисто через QSS
+    // селектор `QComboBox QAbstractItemView` (см. main.cpp), без хирургии над view()
+    // и его window flags. Оставляем функцию no-op'ом, чтобы не трогать сигнатуру
+    // и точку вызова в конструкторе.
+    Q_UNUSED(combo);
+    Q_UNUSED(isDark);
+}
+
+void MainWindow::animateButtonHover(QPushButton* btn)
+{
+    // ВНИМАНИЕ: эта функция нигде не вызывается, и это осознанно. Анимация "geometry"
+    // виджета, лежащего в layout (а любая кнопка на нашем UI лежит в layout), ломается —
+    // layout-менеджер откатывает геометрию на каждый invalidate()/resize. Если понадобится
+    // hover-эффект на кнопке — бери animateHoverEnter/animateHoverLeave (тень, не geometry).
+    if (!btn) return;
+    auto anim = new QPropertyAnimation(btn, "geometry");
+    anim->setDuration(120);
+
+    QRect start = btn->geometry();
+    QRect end = start.adjusted(-2, -2, 2, 2);
+
+    anim->setStartValue(start);
+    anim->setEndValue(end);
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
+}
+
+void MainWindow::animateHoverEnter(QWidget* w)
+{
+    // ИСПРАВЛЕНИЕ БАГА "СЛОМАННАЯ КНОПКА СТАРТ": здесь раньше анимировалось свойство
+    // "geometry" самого виджета. Проблема в том, что startButton лежит в QHBoxLayout —
+    // а layout-менеджер является ЕДИНСТВЕННЫМ владельцем геометрии своих детей и
+    // откатывает ее на каждый invalidate()/resize/показ. В результате аниматор и layout
+    // дрались за геометрию кнопки одновременно — отсюда дерганье/схлопывание.
+    // Правило: виджет, лежащий в layout, никогда нельзя двигать/ресайзить напрямую.
+    // Вместо этого анимируем существующий QGraphicsDropShadowEffect (см. applyShadow) —
+    // визуально кнопка "приподнимается", а геометрию layout не трогаем вообще.
+    if (!w) return;
+    auto *effect = qobject_cast<QGraphicsDropShadowEffect*>(w->graphicsEffect());
+    if (!effect) return;
+
+    auto anim = new QPropertyAnimation(effect, "blurRadius", w);
+    anim->setDuration(180);
+    anim->setEasingCurve(QEasingCurve::OutCubic);
+    anim->setStartValue(effect->blurRadius());
+    anim->setEndValue(40.0);
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
+}
+
+void MainWindow::animateHoverLeave(QWidget* w)
+{
+    if (!w) return;
+    auto *effect = qobject_cast<QGraphicsDropShadowEffect*>(w->graphicsEffect());
+    if (!effect) return;
+
+    auto anim = new QPropertyAnimation(effect, "blurRadius", w);
+    anim->setDuration(180);
+    anim->setEasingCurve(QEasingCurve::OutCubic);
+    anim->setStartValue(effect->blurRadius());
+    anim->setEndValue(25.0); // Возвращаем к дефолтному радиусу из applyShadow()
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
+}
+
+bool MainWindow::eventFilter(QObject *obj, QEvent *event)
+{
+    if (event->type() == QEvent::Enter) {
+        if (obj == ui->startButton) {
+            animateHoverEnter(ui->startButton);
+        } else if (obj == ui->pluginDropZone || obj == ui->xlsxDropZone) {
+            // можно добавить эффект для зон дропа
+        }
+        return false;
+    }
+    else if (event->type() == QEvent::Leave) {
+        if (obj == ui->startButton) {
+            animateHoverLeave(ui->startButton);
+        }
+        return false;
+    }
+
+    return QMainWindow::eventFilter(obj, event);
+}
 
 MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
     : QMainWindow(parent)
@@ -69,6 +199,12 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
     setupConnections();           // 4. Связали всё сигналами
 
     // Первая отрисовка
+    setupModernComboBox(ui->configComboBox);
+    applyShadow(ui->startButton);
+    applyShadow(ui->pluginDropZone);
+    applyShadow(ui->xlsxDropZone);
+    fadeIn(ui->logTextEdit);
+
     updateConfigList();
     updateXlsxList();
     updateInterfaceIcons();
@@ -120,19 +256,31 @@ void MainWindow::setupCoreComponents()
 
 void MainWindow::setupWidgets()
 {
+    // Курсор-рука на кликабельных кнопках — правильный способ в Qt: свойства "cursor"
+    // в QSS не существует (это чистый CSS), Qt Style Sheets его не поддерживают и
+    // молча ругаются в консоли ("Unknown property cursor"), ничего не применяя.
+    const QList<QPushButton*> clickableButtons = {
+        ui->startButton, ui->settingsButton, ui->openFolderButton,
+        ui->browseXlsxButton, ui->openXlsxFolderButton,
+        ui->clearInputDirButton, ui->refreshXlsxButton
+    };
+    for (QPushButton *btn : clickableButtons) {
+        if (btn) btn->setCursor(Qt::PointingHandCursor);
+    }
+
+    // Устанавливаем eventFilter для плавных hover-анимаций
+    ui->startButton->installEventFilter(this);
+    ui->pluginDropZone->installEventFilter(this);
+    ui->xlsxDropZone->installEventFilter(this);
+
     QListView* popupListView = qobject_cast<QListView*>(ui->configComboBox->view());
     if (popupListView) {
-        popupListView->setMouseTracking(true); // Включаем отслеживание мыши для hover-эффектов
-
-        // Включаем поддержку кастомных стилей для отображения элементов
+        popupListView->setMouseTracking(true);
         popupListView->setStyleSheet(
-            "QListView::item {"
-            "    padding: 8px;"
-            "    border-bottom: 1px solid rgba(255,255,255,0.05);"
-            "}"
-            "QListView::item:hover {"
-            "    background-color: #2c3e50;"
-            "}"
+            // Убрал border-bottom между айтемами — в попапе это читалось как отдельные
+            // "рамки" вокруг каждой строчки. Разделение теперь только через padding и hover.
+            "QListView::item { padding: 8px; }"
+            "QListView::item:hover { background-color: rgba(46, 204, 113, 0.15); }" // Тот же зелёный акцент, что и в остальном QSS
             );
     }
 
@@ -246,10 +394,10 @@ void MainWindow::clearHoverStyles()
         ui->pluginDropZone->style()->unpolish(ui->pluginDropZone);
         ui->pluginDropZone->style()->polish(ui->pluginDropZone);
     }
-    if (ui->xlsxList->property("dragHover").toBool() == true) {
-        ui->xlsxList->setProperty("dragHover", false);
-        ui->xlsxList->style()->unpolish(ui->xlsxList);
-        ui->xlsxList->style()->polish(ui->xlsxList);
+    if (ui->xlsxDropZone->property("dragHover").toBool() == true) {
+        ui->xlsxDropZone->setProperty("dragHover", false);
+        ui->xlsxDropZone->style()->unpolish(ui->xlsxDropZone);
+        ui->xlsxDropZone->style()->polish(ui->xlsxDropZone);
     }
 }
 
@@ -276,7 +424,7 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
     // а не только свернутый configComboBox, в который было тяжело попасть мышью.
     QPoint windowPos = event->position().toPoint();
     QPoint localDropZonePos = ui->pluginDropZone->mapFrom(this, windowPos);
-    QPoint localXlsxPos  = ui->xlsxList->mapFrom(this, windowPos);
+    QPoint localXlsxPos  = ui->xlsxDropZone->mapFrom(this, windowPos);
 
     // ВАЖНО: смотрим на ВСЕ перетаскиваемые файлы, а не только на urls().first().
     // Раньше, если тащили разом архив плагина и xlsx-файл, тип определялся только
@@ -316,12 +464,12 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
         }
     }
     // ПРОВЕРКА ЗОНЫ XLSX ТАБЛИЦ (xlsxList)
-    else if (ui->xlsxList->rect().contains(localXlsxPos)) {
+    else if (ui->xlsxDropZone->rect().contains(localXlsxPos)) {
         if (hasExcelFile || hasPluginArchive) {
-            if (ui->xlsxList->property("dragHover").toBool() != true) {
-                ui->xlsxList->setProperty("dragHover", true); // Свойство dragHover активируется таблицей стилей из main.cpp
-                ui->xlsxList->style()->unpolish(ui->xlsxList);
-                ui->xlsxList->style()->polish(ui->xlsxList);
+            if (ui->xlsxDropZone->property("dragHover").toBool() != true) {
+                ui->xlsxDropZone->setProperty("dragHover", true);
+                ui->xlsxDropZone->style()->unpolish(ui->xlsxDropZone);
+                ui->xlsxDropZone->style()->polish(ui->xlsxDropZone);
             }
             if (ui->pluginDropZone->property("dragHover").toBool() != false) {
                 ui->pluginDropZone->setProperty("dragHover", false);
@@ -434,7 +582,7 @@ void MainWindow::dropEvent(QDropEvent *event)
     // ========================================================================
     // ОБРАБОТКА: ЗОНА XLSX ТАБЛИЦ (xlsxList)
     // ========================================================================
-    if (ui->xlsxList->rect().contains(localXlsxPos)) {
+    if (ui->xlsxDropZone->rect().contains(localXlsxPos)) {
         QString inputFolder = m_appSettings.value("inputFolder",
                                                   QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input").toString();
 
@@ -1007,7 +1155,21 @@ void MainWindow::updateXlsxList()
     // entryList теперь вернет и мелкие, и капсовые расширения (.XLSX)
     QStringList files = inputDir.entryList(filters, QDir::Files, QDir::Name | QDir::IgnoreCase);
 
-    ui->xlsxList->addItems(files);
+    if (files.isEmpty()) {
+        // ИСПРАВЛЕНИЕ "СТРАННОГО СПИСКА": раньше пустой список был просто безликим
+        // темным прямоугольником без единой подсказки, что сюда вообще можно кидать
+        // файлы. Добавляем невыбираемый плейсхолдер-подсказку вместо пустоты.
+        QListWidgetItem *placeholder = new QListWidgetItem("Перетащите XLSX-файлы сюда\nили добавьте через кнопку ниже");
+        placeholder->setFlags(Qt::NoItemFlags); // Не кликабелен, не выделяется, не выбирается
+        placeholder->setTextAlignment(Qt::AlignCenter);
+        QFont placeholderFont = placeholder->font();
+        placeholderFont.setItalic(true);
+        placeholder->setFont(placeholderFont);
+        placeholder->setForeground(QBrush(palette().color(QPalette::Disabled, QPalette::Text)));
+        ui->xlsxList->addItem(placeholder);
+    } else {
+        ui->xlsxList->addItems(files);
+    }
 }
 
 void MainWindow::updateConfigList()
@@ -1108,6 +1270,10 @@ void MainWindow::onConfigSelected(int index)
 
 void MainWindow::updateConfigPreview(int configId)
 {
+    // Подстраховка на случай, если .ui когда-нибудь перегенерируют без alignment —
+    // без этого картинка иконки прижимается в левый верхний угол вместо центра.
+    ui->configIcon->setAlignment(Qt::AlignCenter);
+
     // Сначала жестко сбрасываем всё в дефолтное состояние
     ui->configIcon->clear();
     ui->configName->setText("Не выбрано");
@@ -1125,7 +1291,7 @@ void MainWindow::updateConfigPreview(int configId)
     if (!preview["icon"].isEmpty()) {
         QPixmap pixmap(preview["icon"]);
         if (!pixmap.isNull()) {
-            QSize iconSize(64, 64);
+            QSize iconSize(72, 72);
             ui->configIcon->setPixmap(pixmap.scaled(iconSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
         } else {
             qDebug() << "Не удалось загрузить картинку по пути:" << preview["icon"];
