@@ -11,9 +11,10 @@
 #include <QStandardPaths>
 #include <QJsonArray>
 #include <QSettings>
+#include <QDirIterator>
 
 namespace {
-QProcessEnvironment buildIsolatedPythonEnv(const QString &pythonExePath)
+QProcessEnvironment buildIsolatedPythonEnv(const QString &pythonExePath, const QString &depsDir = QString())
 {
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
 
@@ -22,35 +23,44 @@ QProcessEnvironment buildIsolatedPythonEnv(const QString &pythonExePath)
     env.insert("PYTHONUTF8", "1");
     env.insert("PYTHONLEGACYWINDOWSSTDIO", "1");
 
-    // Жёсткая изоляция
     QString pythonDir = QDir::toNativeSeparators(QFileInfo(pythonExePath).absolutePath());
     if (!pythonDir.isEmpty()) {
         QString oldPath = env.value("PATH");
-        // Сначала директория нашего Python + Scripts (для venv), потом остальное
         QString newPath = pythonDir + ";" + pythonDir + "\\Scripts;" + oldPath;
         env.insert("PATH", newPath);
     }
 
-    // Дополнительная защита
-    // ИСПРАВЛЕНИЕ "Module use of python312.dll conflicts with this version of Python":
-    // раньше PYTHONHOME форсированно ставился на папку exe ВООБЩЕ ВСЕГДА — включая
-    // случай, когда pythonExePath это venv/Scripts/python.exe. Но у venv СВОЙ
-    // механизм поиска настоящей базовой установки через pyvenv.cfg (там прописан
-    // путь к "home ="), и он работает автоматически. Принудительный PYTHONHOME на
-    // venv/Scripts ломает этот механизм: интерпретатор считает, что stdlib и
-    // python3xx.dll лежат прямо в Scripts (где их физически нет), не может их
-    // найти там и в итоге подхватывает НЕПРАВИЛЬНУЮ/несовместимую python3xx.dll
-    // откуда-то ещё из PATH — отсюда и ImportError о конфликте версий dll.
-    // PYTHONHOME ставим только когда запускаем БАЗОВЫЙ (не venv) python.exe —
-    // для venv-питона просто ничего не трогаем и даем venv разобраться самому.
-    bool isVenvPython = pythonExePath.contains(".venv", Qt::CaseInsensitive);
-    if (!isVenvPython) {
-        QString pythonHome = QDir::toNativeSeparators(QFileInfo(pythonExePath).absolutePath());
-        env.insert("PYTHONHOME", pythonHome);
+    QString pythonHome = QDir::toNativeSeparators(QFileInfo(pythonExePath).absolutePath());
+    env.insert("PYTHONHOME", pythonHome);
+
+    // === ИСПРАВЛЕННЫЙ PYTHONPATH ===
+    if (!depsDir.isEmpty()) {
+        QString nativeDeps = QDir::toNativeSeparators(depsDir);
+        QString pythonPath = nativeDeps;
+
+        qDebug() << "[PYTHON ENV] depsDir =" << nativeDeps;
+
+        // Рекурсивно собираем все директории
+        QDirIterator it(depsDir, QDir::Dirs | QDir::NoDotAndDotDot,
+                        QDirIterator::Subdirectories | QDirIterator::FollowSymlinks);
+
+        int count = 0;
+        while (it.hasNext()) {
+            QString subDir = QDir::toNativeSeparators(it.next());
+            if (!pythonPath.contains(subDir)) {
+                pythonPath += ";" + subDir;
+                count++;
+            }
+        }
+
+        qDebug() << "[PYTHON ENV] Добавлено подпапок:" << count;
+        qDebug() << "[PYTHON ENV] Итоговый PYTHONPATH:" << pythonPath;
+
+        env.insert("PYTHONPATH", pythonPath);
     } else {
-        env.remove("PYTHONHOME"); // На случай если унаследован из системного окружения
+        qDebug() << "[PYTHON ENV] depsDir пустой!";
+        env.remove("PYTHONPATH");
     }
-    env.remove("PYTHONPATH"); // чистим, чтобы не тянулось лишнее
 
 #endif
     return env;
@@ -113,15 +123,13 @@ bool PluginEngine::prepareDependencies(const QString &cacheDir)
     dummyCfg.cachePath = cacheDir;
     dummyCfg.id = 0; // Идентификатор для общей подготовки, если критично
 
-    // getPythonExecutable сам очистит venv, если он «битый»
-    QString pythonBin = getPythonExecutable(dummyCfg);
+    QString depsDir = cacheDir + "/py_deps";
+    QString installedMarker = depsDir + "/.requirements_installed";
 
-    // Если вернулся базовый Python, значит venv нет или он удален как невалидный.
-    // Запускаем сборку окружения.
-    if (!pythonBin.contains(".venv")) {
-        qInfo() << "[PREPARE] Локальный venv не готов или поврежден. Инициализация сборки...";
+    if (!QFile::exists(installedMarker)) {
+        qInfo() << "[PREPARE] Зависимости плагина еще не установлены. Инициализация сборки...";
         // Вызываем setupPythonEnvironment. Если для этого конфига не требуются зависимости,
-        // метод вернет true, иначе запустит асинкральный pip.
+        // метод вернет true, иначе запустит асинхронный pip.
         setupPythonEnvironment(dummyCfg);
     }
 
@@ -148,42 +156,43 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
                     qInfo() << "Requirements.txt успешно сгенерирован автоматически.";
                 }
             } else {
+                // ИСПРАВЛЕНИЕ: для плагинов без единой зависимости раньше маркер
+                // готовности никогда не создавался (ставить-то нечего) — из-за этого
+                // runPlugin() на каждый запуск считал окружение неготовым и вечно
+                // репортил "isInitializing", а до реального запуска скрипта дело
+                // не доходило вообще никогда. Помечаем "готово" явно.
+                QDir(cfg.cachePath + "/py_deps").mkpath(".");
+                QFile marker(cfg.cachePath + "/py_deps/.requirements_installed");
+                if (marker.open(QIODevice::WriteOnly)) {
+                    marker.close();
+                }
                 return true;
             }
         }
     }
 
-    QString venvPath = cfg.cachePath + "/.venv";
-    QString venvPython;
-#ifdef Q_OS_WIN
-    venvPython = venvPath + "/Scripts/python.exe";
-#else
-    venvPython = venvPath + "/bin/python";
-#endif
+    // ПЕРЕХОД С VENV НА "--target": зависимости плагина теперь ставятся не в
+    // изолированное venv-окружение (со своей копией python.exe), а обычным
+    // `pip install --target <depsDir>` от лица ЕДИНСТВЕННОГО базового
+    // интерпретатора. Это устраняет целый класс проблем с портативной
+    // embeddable-сборкой Python: там нет модуля venv, а откат на virtualenv
+    // иногда копирует python3xx.dll, который конфликтует с оригиналом
+    // (ImportError: "conflicts with this version of Python"). Раз мы больше
+    // никогда не запускаем второй/скопированный python.exe — такой конфликт
+    // становится физически невозможен.
+    QString depsDir = cfg.cachePath + "/py_deps";
+    QString installedMarker = depsDir + "/.requirements_installed";
 
-    QString nativeVenvPython = QDir::toNativeSeparators(venvPython);
-    QString installedMarker = venvPath + "/.requirements_installed";
-
-    // Запрашиваем путь через «умный» метод.
-    QString currentPython = getPythonExecutable(cfg);
-
-    // Если метод вернул путь к venv И маркер на месте — ничего делать не нужно
-    if (currentPython == nativeVenvPython && QFile::exists(installedMarker)) {
-        qInfo() << "Окружение venv проверено, валидно и содержит установленные зависимости.";
+    if (QFile::exists(installedMarker)) {
+        qInfo() << "Зависимости плагина уже установлены, пропускаем pip.";
         return true;
     }
 
-    // Если мы здесь — venv гарантированно пустой или очищенный. Нужен БАЗОВЫЙ
-    // интерпретатор для пересборки venv — не тот же getPythonExecutable(cfg),
-    // который снова найдет этот же (уже известный нам как пустой/битый) venv
-    // на Шаге 1 и никогда не доберется до портативного/системного Python.
-    if (currentPython.isEmpty() || currentPython == nativeVenvPython) {
-        currentPython = findBaseInterpreter();
-        if (currentPython.isEmpty()) {
-            infoLogRequested("[КРИТИЧЕСКАЯ ОШИБКА] Базовый Python интерпретатор не найден в системе!");
-            qWarning() << "Критическая ошибка: Базовый Python интерпретатор не найден!";
-            return false;
-        }
+    QString currentPython = findBaseInterpreter();
+    if (currentPython.isEmpty()) {
+        infoLogRequested("[КРИТИЧЕСКАЯ ОШИБКА] Базовый Python интерпретатор не найден в системе!");
+        qWarning() << "Критическая ошибка: Базовый Python интерпретатор не найден!";
+        return false;
     }
 
     // Проверяем физическое наличие файла базового интерпретатора на диске
@@ -193,50 +202,15 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
         return false;
     }
 
-    QString nativeReqPath = QDir::toNativeSeparators(reqPath);
-    QString nativeVenvPath = QDir::toNativeSeparators(venvPath);
-    QString nativeBasePython = QDir::toNativeSeparators(currentPython);
-
-    // 1. Создаем venv синхронно
-    infoLogRequested("[ДВИЖОК] Создаю чистое виртуальное окружение venv из: " + nativeBasePython);
-
-    QProcess createVenv;
-    createVenv.setProcessEnvironment(buildIsolatedPythonEnv(nativeBasePython));
-
-    // Попытка №1: Используем стандартный модуль venv
-    createVenv.start(nativeBasePython, QStringList() << "-m" << "venv" << nativeVenvPath);
-
-    if (!createVenv.waitForFinished(30000) || createVenv.exitCode() != 0) {
-        QString errText = QString::fromLocal8Bit(createVenv.readAllStandardError());
-
-        // Если ошибка в том, что модуля venv не существует, пробуем virtualenv!
-        if (errText.contains("No module named venv")) {
-            infoLogRequested("[ДВИЖОК] Модуль venv не найден. Пробую альтернативный virtualenv...");
-
-            createVenv.start(nativeBasePython, QStringList() << "-m" << "virtualenv" << nativeVenvPath);
-
-            if (createVenv.waitForFinished(30000) && createVenv.exitCode() == 0) {
-                errText.clear(); // Успешно создано через virtualenv, сбрасываем текст ошибки
-                infoLogRequested("[ДВИЖОК] Виртуальное окружение успешно создано с помощью virtualenv!");
-            } else {
-                errText = QString::fromLocal8Bit(createVenv.readAllStandardError());
-            }
-        }
-
-        // Если и вторая попытка провалилась, или была другая ошибка
-        if (!errText.isEmpty() || createVenv.exitCode() != 0) {
-            QString outText = QString::fromLocal8Bit(createVenv.readAllStandardOutput());
-            QString procErr = createVenv.errorString();
-
-            infoLogRequested(QString("[ОШИБКА VENV] Не удалось создать venv ни через venv, ни через virtualenv. exitCode=%1, processError=%2\nstderr: %3\nstdout: %4")
-                                 .arg(createVenv.exitCode())
-                                 .arg(procErr)
-                                 .arg(errText.isEmpty() ? "(пусто)" : errText)
-                                 .arg(outText.isEmpty() ? "(пусто)" : outText));
-            qWarning() << "Не удалось создать venv:" << errText;
-            return false;
-        }
+    if (!QDir(depsDir).mkpath(".")) {
+        infoLogRequested("[ОШИБКА] Не удалось создать папку для зависимостей плагина: " + depsDir);
+        qWarning() << "Не удалось создать папку зависимостей:" << depsDir;
+        return false;
     }
+
+    QString nativeReqPath = QDir::toNativeSeparators(reqPath);
+    QString nativeDepsDir = QDir::toNativeSeparators(depsDir);
+    QString nativeBasePython = QDir::toNativeSeparators(currentPython);
 
     // 2. АСИНХРОННЫЙ ЗАПУСК PIP
     if (m_pipProcess && m_pipProcess->state() != QProcess::NotRunning) {
@@ -254,10 +228,10 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
     m_pipProcess = new QProcess(this);
     QProcess* proc = m_pipProcess;
 
-    proc->setProcessEnvironment(buildIsolatedPythonEnv(nativeVenvPython));
+    proc->setProcessEnvironment(buildIsolatedPythonEnv(nativeBasePython));
 
     QStringList pipArgs;
-    pipArgs << "-m" << "pip" << "install" << "-r" << nativeReqPath;
+    pipArgs << "-m" << "pip" << "install" << "--target" << nativeDepsDir << "-r" << nativeReqPath;
 
     // --- КОННЕКТЫ (Контекст жизни — proc) ---
 
@@ -331,7 +305,7 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
                      });
 
     qInfo() << "Запуск асинхронной установки зависимостей для плагина...";
-    proc->start(nativeVenvPython, pipArgs);
+    proc->start(nativeBasePython, pipArgs);
 
     if (!proc->waitForStarted(5000)) {
         qWarning() << "Не удалось запустить pip процесс:" << proc->errorString();
@@ -431,16 +405,10 @@ QVariantMap PluginEngine::runPlugin(const CachedConfig &cfg, const QVariantMap &
     if (cfg.configType == "executable" || cfg.configType == "python-script") {
 
         if (cfg.configType == "python-script") {
-            QString venvPath = cfg.cachePath + "/.venv";
-            QString installedMarker = venvPath + "/.requirements_installed";
+            QString depsDir = cfg.cachePath + "/py_deps";
+            QString installedMarker = depsDir + "/.requirements_installed";
 
-#ifdef Q_OS_WIN
-            QString venvPython = venvPath + "/Scripts/python.exe";
-#else
-            QString venvPython = venvPath + "/bin/python";
-#endif
-
-            if (!QFile::exists(venvPython) || !QFile::exists(installedMarker)) {
+            if (!QFile::exists(installedMarker)) {
                 if (m_pipProcess && m_pipProcess->state() != QProcess::NotRunning) {
                     QVariantMap waitResult;
                     waitResult["success"] = false;
@@ -454,11 +422,11 @@ QVariantMap PluginEngine::runPlugin(const CachedConfig &cfg, const QVariantMap &
                 m_delayedCfg = cfg;
                 m_delayedParams = params;
 
-                qInfo() << "Окружение не готово. Запуск инициализации venv для конфига:" << cfg.id;
+                qInfo() << "Окружение не готово. Запуск установки зависимостей для конфига:" << cfg.id;
 
                 if (!setupPythonEnvironment(cfg)) {
                     // setupPythonEnvironment провалилась СИНХРОННО (нет Python в системе,
-                    // не удалось создать venv, не смог стартовать pip-процесс и т.п.).
+                    // не удалось создать папку зависимостей, не смог стартовать pip-процесс и т.п.).
                     // Раньше этот false просто игнорировался: m_isWaitingForPip оставался true
                     // навсегда, никакой сигнал завершения уже не придет (процесс так и не запустился),
                     // и UI зависал на "⏳ Установка библиотек..." без единой ошибки пользователю.
@@ -544,20 +512,64 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
         args << inputPath << outputPath;
     }
     else if (cfg.configType == "python-script") {
-        // Теперь getPythonExecutable гарантированно вернет .venv, так как он валидируется в prepareDependencies
-        program = getPythonExecutable(cfg);
-
+        program = findBaseInterpreter();
         if (program.isEmpty()) {
-            startupError = "Интерпретатор Python не найден в системе!";
+            startupError = "Интерпретатор Python не найден!";
             QFile::remove(inputPath);
             return false;
         }
 
-        QString nativeInputPath = QDir::toNativeSeparators(inputPath);
-        QString nativeOutputPath = QDir::toNativeSeparators(outputPath);
-        QString nativeEntryPoint = QDir::toNativeSeparators(cfg.entryPoint);
+        QString depsDir = cfg.cachePath + "/py_deps";
+        QString scriptPath = cfg.entryPoint;
+        QString bootstrapPath = cfg.cachePath + "/bootstrap.py";
 
-        args << nativeEntryPoint << nativeInputPath << nativeOutputPath;
+        // === КЕШИРОВАНИЕ BOOTSTRAP ===
+        bool bootstrapExists = QFile::exists(bootstrapPath);
+        bool depsChanged = false;
+
+        // Простая проверка изменения зависимостей (по маркеру)
+        QString markerPath = depsDir + "/.requirements_installed";
+        if (bootstrapExists) {
+            QFileInfo bootstrapInfo(bootstrapPath);
+            QFileInfo markerInfo(markerPath);
+            if (markerInfo.exists() && markerInfo.lastModified() > bootstrapInfo.lastModified()) {
+                depsChanged = true;
+            }
+        }
+
+        if (!bootstrapExists || depsChanged) {
+            QFile bootstrapFile(bootstrapPath);
+            if (bootstrapFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                QTextStream out(&bootstrapFile);
+                out << "import sys\n";
+                out << "import os\n";
+                out << "import site\n\n";
+                out << "# Bootstrap для FinWizard (кешируется)\n";
+                out << "deps_dir = r'" << QDir::toNativeSeparators(depsDir) << "'\n";
+                out << "if os.path.exists(deps_dir):\n";
+                out << "    site.addsitedir(deps_dir)\n";
+                out << "    for root, dirs, files in os.walk(deps_dir):\n";
+                out << "        if root not in sys.path:\n";
+                out << "            sys.path.append(root)\n";
+                out << "    print('[BOOTSTRAP] Зависимости загружены (кеш)')\n\n";
+                out << "# Запускаем оригинальный скрипт\n";
+                out << "script_path = r'" << QDir::toNativeSeparators(scriptPath) << "'\n";
+                out << "with open(script_path, encoding='utf-8') as f:\n";
+                out << "    exec(f.read())\n";
+                bootstrapFile.close();
+                qDebug() << "[BOOTSTRAP] Создан/обновлён кеш bootstrap.py";
+            }
+        } else {
+            qDebug() << "[BOOTSTRAP] Используем кешированный bootstrap.py";
+        }
+
+        QString nativeBootstrap = QDir::toNativeSeparators(bootstrapPath);
+        QString nativeInput = QDir::toNativeSeparators(inputPath);
+        QString nativeOutput = QDir::toNativeSeparators(outputPath);
+
+        args << nativeBootstrap << nativeInput << nativeOutput;
+
+        qDebug() << "[BOOTSTRAP] Запуск через" << nativeBootstrap;
     }
 
     // 3. ЗАПУСКАЕМ ПРОЦЕСС АСИНХРОННО
@@ -567,7 +579,8 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
 
     qInfo() << "Запуск внешнего процесса (асинхронно):" << program << args;
 
-    proc->setProcessEnvironment(buildIsolatedPythonEnv(program));
+    QString depsDirForEnv = (cfg.configType == "python-script") ? (cfg.cachePath + "/py_deps") : QString();
+    proc->setProcessEnvironment(buildIsolatedPythonEnv(program, depsDirForEnv));
 
     // Локальные копии данных из cfg для безопасного захвата по значению в лямбды
     const int cfgId = cfg.id;
@@ -663,46 +676,11 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
     return true;
 }
 
-QString PluginEngine::getPythonExecutable(const CachedConfig &cfg) const
-{
-    // Безопасный каст для вызова сигналов из const-метода
-    PluginEngine* mutableThis = const_cast<PluginEngine*>(this);
-
-    mutableThis->infoLogRequested("=== [PYTHON SEARCH] Начинаю поиск интерпретатора ===");
-
-    QString venvPython;
-#ifdef Q_OS_WIN
-    venvPython = cfg.cachePath + "/.venv/Scripts/python.exe";
-#else
-    venvPython = cfg.cachePath + "/.venv/bin/python";
-#endif
-
-    mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 1: Проверка venv плагина: " + QDir::toNativeSeparators(venvPython));
-    if (QFile::exists(venvPython)) {
-        mutableThis->infoLogRequested("--> Найдено локальное окружение venv плагина.");
-        return QDir::toNativeSeparators(venvPython);
-    }
-
-    // Венва нет — делегируем поиск БАЗОВОГО интерпретатора отдельному методу
-    // (портативный/системный Python), который сам не заглядывает внутрь venv.
-    return findBaseInterpreter();
-}
-
 QString PluginEngine::findBaseInterpreter() const
 {
-    // ИСПРАВЛЕНИЕ БАГА "БАЗОВЫЙ PYTHON НЕ НАЙДЕН": раньше setupPythonEnvironment(),
-    // когда ему требовался базовый интерпретатор для (пере)сборки venv, повторно
-    // звал getPythonExecutable(cfg) — а тот на Шаге 1 ВСЕГДА сначала проверяет venv
-    // и, если venv физически существует (даже сломанный/пустой — именно наш случай:
-    // зависимости не установлены, но папка venv уже создана), тут же находит и
-    // возвращает ЕГО ЖЕ, вместо перехода к поиску базового Python. Дальше код
-    // видел в ответе ".venv" и ошибочно решал, что базовый интерпретатор "не
-    // найден" — хотя портативный/системный Python на Шаге 2/3 мог быть доступен
-    // и просто не проверялся. Этот метод — точная копия шагов 2/3 без венв-шага 1,
-    // специально для случаев "мне нужен ЧИСТЫЙ базовый Python, а не venv".
     PluginEngine* mutableThis = const_cast<PluginEngine*>(this);
 
-    mutableThis->infoLogRequested("=== [PYTHON SEARCH] Начинаю поиск БАЗОВОГО интерпретатора (venv намеренно пропущен) ===");
+    mutableThis->infoLogRequested("=== [PYTHON SEARCH] Начинаю поиск интерпретатора Python ===");
 
     QString appDir = QCoreApplication::applicationDirPath();
     QString basePython;
@@ -767,75 +745,4 @@ QString PluginEngine::findBaseInterpreter() const
     QString finalPath = QDir::toNativeSeparators(basePython);
     mutableThis->infoLogRequested("=== [PYTHON SEARCH] Итоговый выбранный базовый путь: " + finalPath + " ===");
     return finalPath;
-}
-
-bool PluginEngine::isVenvValid(const QString &cachePath, const QString &currentBasePython) const
-{
-    QString venvPath = cachePath + "/.venv";
-    QString cfgPath = venvPath + "/pyvenv.cfg";
-    if (!QFile::exists(cfgPath)) {
-        return false;
-    }
-
-    QString venvPython;
-#ifdef Q_OS_WIN
-    venvPython = venvPath + "/Scripts/python.exe";
-#else
-    venvPython = venvPath + "/bin/python";
-#endif
-
-    if (!QFile::exists(venvPython)) {
-        return false;
-    }
-
-    // 1. Проверяем привязку к базовому Python через ручной парсинг pyvenv.cfg
-    if (QDir::isAbsolutePath(currentBasePython)) {
-        QFile cfgFile(cfgPath);
-        QString venvHomeDir;
-        if (cfgFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QTextStream in(&cfgFile);
-            while (!in.atEnd()) {
-                QString line = in.readLine().trimmed();
-                if (line.startsWith("home")) {
-                    QStringList parts = line.split('=');
-                    if (parts.size() >= 2) {
-                        venvHomeDir = parts.mid(1).join('=').trimmed();
-                    }
-                    break;
-                }
-            }
-            cfgFile.close();
-        }
-
-        if (venvHomeDir.isEmpty()) {
-            return false;
-        }
-
-        QFileInfo baseInfo(currentBasePython);
-        QString currentHomeDir = baseInfo.absoluteDir().absolutePath();
-
-        QString canonicalVenvHome = QDir(venvHomeDir).canonicalPath();
-        QString canonicalCurrentHome = QDir(currentHomeDir).canonicalPath();
-
-        if (canonicalVenvHome.isEmpty() || canonicalVenvHome != canonicalCurrentHome) {
-            PluginEngine* mutableThis = const_cast<PluginEngine*>(this);
-            mutableThis->infoLogRequested(QString("[VENV VALID] Несовпадение путей! В конфиге: %1, Текущий: %2")
-                                              .arg(canonicalVenvHome).arg(canonicalCurrentHome));
-            return false;
-        }
-    }
-
-    // 2. Тест работоспособности pip
-    QString nativeVenvPythonCheck = QDir::toNativeSeparators(venvPython);
-    QProcess testProc;
-    testProc.setProcessEnvironment(buildIsolatedPythonEnv(nativeVenvPythonCheck));
-
-    testProc.start(nativeVenvPythonCheck, QStringList() << "-m" << "pip" << "--version");
-    if (!testProc.waitForFinished(4000) || testProc.exitCode() != 0) {
-        PluginEngine* mutableThis = const_cast<PluginEngine*>(this);
-        mutableThis->infoLogRequested("[VENV VALID] Тестовый запуск pip внутри venv завершился с ошибкой!");
-        return false;
-    }
-
-    return true;
 }
