@@ -32,8 +32,24 @@ QProcessEnvironment buildIsolatedPythonEnv(const QString &pythonExePath)
     }
 
     // Дополнительная защита
-    QString pythonHome = QDir::toNativeSeparators(QFileInfo(pythonExePath).absolutePath());
-    env.insert("PYTHONHOME", pythonHome);
+    // ИСПРАВЛЕНИЕ "Module use of python312.dll conflicts with this version of Python":
+    // раньше PYTHONHOME форсированно ставился на папку exe ВООБЩЕ ВСЕГДА — включая
+    // случай, когда pythonExePath это venv/Scripts/python.exe. Но у venv СВОЙ
+    // механизм поиска настоящей базовой установки через pyvenv.cfg (там прописан
+    // путь к "home ="), и он работает автоматически. Принудительный PYTHONHOME на
+    // venv/Scripts ломает этот механизм: интерпретатор считает, что stdlib и
+    // python3xx.dll лежат прямо в Scripts (где их физически нет), не может их
+    // найти там и в итоге подхватывает НЕПРАВИЛЬНУЮ/несовместимую python3xx.dll
+    // откуда-то ещё из PATH — отсюда и ImportError о конфликте версий dll.
+    // PYTHONHOME ставим только когда запускаем БАЗОВЫЙ (не venv) python.exe —
+    // для venv-питона просто ничего не трогаем и даем venv разобраться самому.
+    bool isVenvPython = pythonExePath.contains(".venv", Qt::CaseInsensitive);
+    if (!isVenvPython) {
+        QString pythonHome = QDir::toNativeSeparators(QFileInfo(pythonExePath).absolutePath());
+        env.insert("PYTHONHOME", pythonHome);
+    } else {
+        env.remove("PYTHONHOME"); // На случай если унаследован из системного окружения
+    }
     env.remove("PYTHONPATH"); // чистим, чтобы не тянулось лишнее
 
 #endif
@@ -157,10 +173,13 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
         return true;
     }
 
-    // Если мы здесь — venv гарантированно пустой или очищенный.
+    // Если мы здесь — venv гарантированно пустой или очищенный. Нужен БАЗОВЫЙ
+    // интерпретатор для пересборки venv — не тот же getPythonExecutable(cfg),
+    // который снова найдет этот же (уже известный нам как пустой/битый) venv
+    // на Шаге 1 и никогда не доберется до портативного/системного Python.
     if (currentPython.isEmpty() || currentPython == nativeVenvPython) {
-        currentPython = getPythonExecutable(cfg);
-        if (currentPython.contains(".venv") || currentPython.isEmpty()) {
+        currentPython = findBaseInterpreter();
+        if (currentPython.isEmpty()) {
             infoLogRequested("[КРИТИЧЕСКАЯ ОШИБКА] Базовый Python интерпретатор не найден в системе!");
             qWarning() << "Критическая ошибка: Базовый Python интерпретатор не найден!";
             return false;
@@ -664,6 +683,27 @@ QString PluginEngine::getPythonExecutable(const CachedConfig &cfg) const
         return QDir::toNativeSeparators(venvPython);
     }
 
+    // Венва нет — делегируем поиск БАЗОВОГО интерпретатора отдельному методу
+    // (портативный/системный Python), который сам не заглядывает внутрь venv.
+    return findBaseInterpreter();
+}
+
+QString PluginEngine::findBaseInterpreter() const
+{
+    // ИСПРАВЛЕНИЕ БАГА "БАЗОВЫЙ PYTHON НЕ НАЙДЕН": раньше setupPythonEnvironment(),
+    // когда ему требовался базовый интерпретатор для (пере)сборки venv, повторно
+    // звал getPythonExecutable(cfg) — а тот на Шаге 1 ВСЕГДА сначала проверяет venv
+    // и, если venv физически существует (даже сломанный/пустой — именно наш случай:
+    // зависимости не установлены, но папка venv уже создана), тут же находит и
+    // возвращает ЕГО ЖЕ, вместо перехода к поиску базового Python. Дальше код
+    // видел в ответе ".venv" и ошибочно решал, что базовый интерпретатор "не
+    // найден" — хотя портативный/системный Python на Шаге 2/3 мог быть доступен
+    // и просто не проверялся. Этот метод — точная копия шагов 2/3 без венв-шага 1,
+    // специально для случаев "мне нужен ЧИСТЫЙ базовый Python, а не venv".
+    PluginEngine* mutableThis = const_cast<PluginEngine*>(this);
+
+    mutableThis->infoLogRequested("=== [PYTHON SEARCH] Начинаю поиск БАЗОВОГО интерпретатора (venv намеренно пропущен) ===");
+
     QString appDir = QCoreApplication::applicationDirPath();
     QString basePython;
 
@@ -677,14 +717,12 @@ QString PluginEngine::getPythonExecutable(const CachedConfig &cfg) const
         mutableThis->infoLogRequested("[PYTHON SEARCH] Портативный Python рядом с exe не найден. Ищу папку проекта вверх по дереву...");
 
         QDir searchDir(appDir);
-        bool foundInDev = false;
 
         // Поднимаемся вверх, пока не упремся в корень диска
         while (searchDir.absolutePath() != searchDir.rootPath()) {
             QString potentialPath = searchDir.absoluteFilePath("installer/win_python/python.exe");
             if (QFile::exists(potentialPath)) {
                 basePython = potentialPath;
-                foundInDev = true;
                 mutableThis->infoLogRequested("[PYTHON SEARCH] Шаг 2a (Разработка): Успешно найден в папке проекта: " + QDir::toNativeSeparators(basePython));
                 break;
             }
@@ -727,7 +765,7 @@ QString PluginEngine::getPythonExecutable(const CachedConfig &cfg) const
 #endif
 
     QString finalPath = QDir::toNativeSeparators(basePython);
-    mutableThis->infoLogRequested("=== [PYTHON SEARCH] Итоговый выбранный путь: " + finalPath + " ===");
+    mutableThis->infoLogRequested("=== [PYTHON SEARCH] Итоговый выбранный базовый путь: " + finalPath + " ===");
     return finalPath;
 }
 
