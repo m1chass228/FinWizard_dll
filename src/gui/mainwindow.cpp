@@ -1510,4 +1510,5 @@ void MainWindow::updateInterfaceIcons()
     ui->refreshXlsxButton->setIcon(getTintedIcon(":/res/refresh_google.svg"));
     ui->settingsButton->setIcon(getTintedIcon(":/res/settings_google.svg"));
     ui->clearInputDirButton->setIcon(getTintedIcon(":/res/trash_google.svg"));
+    ui->deleteConfigButton->setIcon(getTintedIcon(":/res/trash_google.svg"));
 }

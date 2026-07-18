@@ -13,29 +13,29 @@
 #include <QSettings>
 
 namespace {
-// ИСПРАВЛЕНИЕ "Module use of pythonXXX.dll conflicts with this version of Python":
-// раньше все QProcess'ы (создание venv, pip install, запуск скрипта) наследовали
-// голый QProcessEnvironment::systemEnvironment() как есть. Если в PATH пользователя
-// раньше нашего портативного интерпретатора стоит ДРУГАЯ установка Python той же
-// мажорной версии (Anaconda, Python из Microsoft Store, ещё один локальный питон —
-// у Марии явно так и есть), загрузчик Windows при старте venv-python.exe резолвит
-// pythonXYZ.dll не из папки НАШЕГО интерпретатора, а находит чужую одноимённую DLL
-// раньше по PATH. Дальше любой C-extension модуль (обычно первым падает _socket/_ssl,
-// как в логе) падает с этим ImportError, потому что скомпилирован под другую сборку.
-// Фикс: прописываем директорию интерпретатора, который мы реально запускаем, в
-// начало PATH — тогда её DLL находится первой, конфликт невозможен.
 QProcessEnvironment buildIsolatedPythonEnv(const QString &pythonExePath)
 {
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+
 #ifdef Q_OS_WIN
     env.insert("PYTHONIOENCODING", "utf-8");
     env.insert("PYTHONUTF8", "1");
+    env.insert("PYTHONLEGACYWINDOWSSTDIO", "1");
 
+    // Жёсткая изоляция
     QString pythonDir = QDir::toNativeSeparators(QFileInfo(pythonExePath).absolutePath());
     if (!pythonDir.isEmpty()) {
         QString oldPath = env.value("PATH");
-        env.insert("PATH", pythonDir + ";" + oldPath);
+        // Сначала директория нашего Python + Scripts (для venv), потом остальное
+        QString newPath = pythonDir + ";" + pythonDir + "\\Scripts;" + oldPath;
+        env.insert("PATH", newPath);
     }
+
+    // Дополнительная защита
+    QString pythonHome = QDir::toNativeSeparators(QFileInfo(pythonExePath).absolutePath());
+    env.insert("PYTHONHOME", pythonHome);
+    env.remove("PYTHONPATH"); // чистим, чтобы не тянулось лишнее
+
 #endif
     return env;
 }
