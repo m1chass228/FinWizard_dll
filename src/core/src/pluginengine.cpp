@@ -153,17 +153,25 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
                 if (reqFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
                     QTextStream stream(&reqFile);
                     for (const QJsonValue &dep : depsArray) {
-                        stream << dep.toString().trimmed() << "\n";
+                        QString depLine = dep.toString().trimmed();
+                        // Защита от инъекции в requirements.txt: встроенный перевод строки
+                        // превращает одну "зависимость" в НЕСКОЛЬКО строк файла, а строка,
+                        // начинающаяся с '-', будет прочитана pip как флаг (например,
+                        // "--index-url http://evil"), подменяющий источник пакетов.
+                        // Манифест — по сути внешние данные (плагин мог прислать кто угодно),
+                        // так что валидируем его так же, как любой другой недоверенный ввод.
+                        if (depLine.isEmpty()) continue;
+                        if (depLine.contains('\n') || depLine.contains('\r') || depLine.startsWith('-')) {
+                            qWarning() << "[SECURITY] Отклонена подозрительная строка зависимости в manifest.json:" << depLine;
+                            infoLogRequested("[ОШИБКА] Зависимость отклонена (недопустимые символы или флаг): " + depLine.left(60));
+                            continue;
+                        }
+                        stream << depLine << "\n";
                     }
                     reqFile.close();
                     qInfo() << "Requirements.txt успешно сгенерирован автоматически.";
                 }
             } else {
-                // ИСПРАВЛЕНИЕ: для плагинов без единой зависимости раньше маркер
-                // готовности никогда не создавался (ставить-то нечего) — из-за этого
-                // runPlugin() на каждый запуск считал окружение неготовым и вечно
-                // репортил "isInitializing", а до реального запуска скрипта дело
-                // не доходило вообще никогда. Помечаем "готово" явно.
                 QDir(cfg.cachePath + "/py_deps").mkpath(".");
                 QFile marker(cfg.cachePath + "/py_deps/.requirements_installed");
                 if (marker.open(QIODevice::WriteOnly)) {

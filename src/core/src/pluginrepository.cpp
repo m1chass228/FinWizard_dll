@@ -6,6 +6,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDebug>
+#include <QSet>
 
 #include <quazip/quazip.h>
 #include <quazip/quazipfile.h>
@@ -255,10 +256,24 @@ CachedConfig PluginRepository::parseManifest(const QString &dirPath) const
         return cfg;
     }
 
-    QJsonObject obj = QJsonDocument::fromJson(file.readAll()).object();
+    QJsonParseError parseErr;
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseErr);
+    if (parseErr.error != QJsonParseError::NoError) {
+        cfg.validationMessage = QString("manifest.json содержит некорректный JSON (%1, смещение %2).")
+                                    .arg(parseErr.errorString()).arg(parseErr.offset);
+        return cfg;
+    }
+    QJsonObject obj = doc.object();
     cfg.displayName = obj.value("name").toString().trimmed();
     cfg.description = obj.value("description").toString().trimmed();
     cfg.configType = obj.value("type").toString("cpp-plugin").trimmed();
+
+    static const QSet<QString> kKnownTypes = {"python-script", "executable", "cpp-plugin"};
+    if (!kKnownTypes.contains(cfg.configType)) {
+        cfg.validationMessage = QString("Неизвестный тип плагина в манифесте: \"%1\". Допустимые значения: python-script, executable, cpp-plugin.")
+                                    .arg(cfg.configType);
+        return cfg;
+    }
 
     // --- ПРОВЕРКА ВЕРСИИ ---
     // "version" — собственная версия плагина, чисто информационная, для UI.
@@ -272,9 +287,9 @@ CachedConfig PluginRepository::parseManifest(const QString &dirPath) const
     if (!cfg.minEngineVersion.isEmpty() &&
         compareVersions(FinWizard::kEngineVersion, cfg.minEngineVersion) < 0) {
         cfg.validationMessage = QString(
-            "Плагин требует версию движка FinWizard %1 или новее (установлена %2). "
-            "Обновите приложение, чтобы использовать этот плагин.")
-            .arg(cfg.minEngineVersion, FinWizard::kEngineVersion);
+                                    "Плагин требует версию движка FinWizard %1 или новее (установлена %2). "
+                                    "Обновите приложение, чтобы использовать этот плагин.")
+                                    .arg(cfg.minEngineVersion, FinWizard::kEngineVersion);
         return cfg; // isValid остается false
     }
 
