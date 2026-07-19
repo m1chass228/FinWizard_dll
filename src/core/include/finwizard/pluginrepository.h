@@ -20,6 +20,8 @@ struct CachedConfig {
     QString cachePath;
     QDateTime lastExtracted;
     QDateTime lastUsed;
+    QString version;           // Версия самого плагина (manifest.json "version"), для отображения в UI
+    QString minEngineVersion;  // Минимальная версия FinWizard, требуемая плагином ("min_engine_version")
 };
 
 class PluginRepository

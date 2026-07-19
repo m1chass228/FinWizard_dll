@@ -12,6 +12,9 @@
 #include <QJsonArray>
 #include <QSettings>
 #include <QDirIterator>
+#include <QTimer>
+#include <QRegularExpression>
+#include <QTextStream>
 
 namespace {
 QProcessEnvironment buildIsolatedPythonEnv(const QString &pythonExePath, const QString &depsDir = QString())
@@ -212,6 +215,23 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
     QString nativeDepsDir = QDir::toNativeSeparators(depsDir);
     QString nativeBasePython = QDir::toNativeSeparators(currentPython);
 
+    // Считаем количество ПРЯМЫХ зависимостей для грубой оценки прогресса ниже.
+    // Это не точный процент (pip дополнительно потянет транзитивные зависимости,
+    // на каждую из которых тоже будет своя строка "Collecting" — счетчик может
+    // обогнать total), поэтому в проценте ниже жестко ограничиваем потолок 95%,
+    // чтобы не показать 100% раньше реального завершения pip.
+    int totalPackages = 0;
+    {
+        QFile reqFileForCount(reqPath);
+        if (reqFileForCount.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QTextStream in(&reqFileForCount);
+            while (!in.atEnd()) {
+                QString line = in.readLine().trimmed();
+                if (!line.isEmpty() && !line.startsWith('#')) totalPackages++;
+            }
+        }
+    }
+
     // 2. АСИНХРОННЫЙ ЗАПУСК PIP
     if (m_pipProcess && m_pipProcess->state() != QProcess::NotRunning) {
         qWarning() << "Pip уже запущен для другого процесса, отмена.";
@@ -235,11 +255,28 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
 
     // --- КОННЕКТЫ (Контекст жизни — proc) ---
 
-    QObject::connect(proc, &QProcess::readyReadStandardOutput, proc, [this, proc, cfg]() {
+    QObject::connect(proc, &QProcess::readyReadStandardOutput, proc, [this, proc, cfg, totalPackages]() {
         QString output = proc->readAllStandardOutput().trimmed();
         if (!output.isEmpty()) {
-            qDebug() << "[PIP OUT]:" << output;
             emit pipLogReady(cfg.id, output);
+
+            // Грубый прогресс "N из M пакетов" по строкам "Collecting <pkg>" —
+            // не байтовый прогресс скачивания (pip его не печатает без tty),
+            // но честно показывает, что процесс двигается, а не завис.
+            if (totalPackages > 0) {
+                QRegularExpression collectingRe("^\\s*Collecting\\s", QRegularExpression::MultilineOption);
+                int newlyCollected = 0;
+                auto it = collectingRe.globalMatch(output);
+                while (it.hasNext()) { it.next(); newlyCollected++; }
+
+                if (newlyCollected > 0) {
+                    int collected = proc->property("fw_collected").toInt() + newlyCollected;
+                    proc->setProperty("fw_collected", collected);
+                    int percent = qMin(95, static_cast<int>(collected * 100.0 / totalPackages));
+                    emit pluginProgress(cfg.id, percent,
+                                        QString("Установка зависимостей: %1/%2").arg(qMin(collected, totalPackages)).arg(totalPackages));
+                }
+            }
         }
     });
 
@@ -545,6 +582,23 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
                 out << "import os\n";
                 out << "import site\n\n";
                 out << "# Bootstrap для FinWizard (кешируется)\n";
+                // SDK — ищем в двух местах, по приоритету:
+                //   1) <cachePath>/python_sdk — плагин принёс СВОЮ копию SDK внутри
+                //      архива (например, tar.gz с папкой python_sdk/ рядом с entry-скриптом).
+                //      Так плагин самодостаточен и не зависит от того, что доехало
+                //      до инсталлятора приложения, и может зафиксировать конкретную
+                //      версию SDK, под которую писался.
+                //   2) <appDir>/python_sdk — общая версия, поставляемая с самим
+                //      приложением, используется как fallback, если плагин свою
+                //      копию не принёс.
+                // Путь не меняется между релизами SDK (меняется только содержимое
+                // файла), поэтому смена версии SDK сама по себе не требует
+                // инвалидации кеша bootstrap.py — только смена deps_dir/маркера ниже.
+                out << "sdk_dir_shared = r'" << QDir::toNativeSeparators(QCoreApplication::applicationDirPath() + "/python_sdk") << "'\n";
+                out << "sdk_dir_bundled = r'" << QDir::toNativeSeparators(cfg.cachePath + "/python_sdk") << "'\n";
+                out << "for _sdk_dir in (sdk_dir_shared, sdk_dir_bundled):\n"; // bundled вставляется последним -> выше приоритетом
+                out << "    if os.path.exists(_sdk_dir) and _sdk_dir not in sys.path:\n";
+                out << "        sys.path.insert(0, _sdk_dir)\n\n";
                 out << "deps_dir = r'" << QDir::toNativeSeparators(depsDir) << "'\n";
                 out << "if os.path.exists(deps_dir):\n";
                 out << "    site.addsitedir(deps_dir)\n";
@@ -585,6 +639,80 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
     // Локальные копии данных из cfg для безопасного захвата по значению в лямбды
     const int cfgId = cfg.id;
     const QString configType = cfg.configType;
+
+    // === RPC-МОСТ: построчный JSON-протокол между плагином и движком ===
+    // Отдельный канал от input.json/output.json — только для лёгких сообщений
+    // (log, update_progress, get_db_data) во время выполнения. Плагин пишет
+    // JSON-объект в свой stdout и синхронно блокируется на stdin в ожидании
+    // ответа (см. EngineBridge в finwizard_sdk.py) — поэтому здесь мы обязаны
+    // отвечать на КАЖДЫЙ запрос, иначе плагин зависнет навсегда.
+    QObject::connect(proc, &QProcess::readyReadStandardOutput, proc, [this, proc, cfgId]() {
+        while (proc->canReadLine()) {
+            QByteArray line = proc->readLine().trimmed();
+            if (line.isEmpty()) continue;
+
+            QJsonParseError parseErr;
+            QJsonDocument doc = QJsonDocument::fromJson(line, &parseErr);
+            if (parseErr.error != QJsonParseError::NoError || !doc.isObject()) {
+                // Не наш протокол (случайный print из плагина/библиотеки,
+                // просочившийся мимо _StdoutProxy) — просто логируем, не рвём канал.
+                qDebug() << "[BRIDGE] Не-JSON строка от плагина, игнор:" << line;
+                continue;
+            }
+
+            QJsonObject req = doc.object();
+            int reqId = req.value("id").toInt();
+            QString action = req.value("action").toString();
+            QVariantMap params = req.value("params").toObject().toVariantMap();
+
+            QJsonObject resp{{"id", reqId}};
+
+            if (action == "log") {
+                emit pluginLogRequested(cfgId, params.value("message").toString());
+                resp["success"] = true;
+            } else if (action == "update_progress") {
+                emit pluginProgress(cfgId, params.value("percent").toInt(),
+                                    params.value("text").toString());
+                resp["success"] = true;
+            } else if (m_bridgeHandler) {
+                // Хук для запросов, специфичных для приложения (get_db_data и т.п.) —
+                // устанавливается снаружи через setBridgeHandler(), движок сам
+                // ничего не знает о БД. Хендлер должен быть быстрым: плагин
+                // блокируется на readline() всё это время.
+                QVariantMap result = m_bridgeHandler(cfgId, action, params);
+                bool ok = result.value("success", true).toBool();
+                resp["success"] = ok;
+                if (ok) {
+                    resp["result"] = QJsonValue::fromVariant(result.value("result"));
+                } else {
+                    resp["error"] = result.value("error").toString();
+                }
+            } else {
+                resp["success"] = false;
+                resp["error"] = "Unknown action: " + action;
+            }
+
+            proc->write(QJsonDocument(resp).toJson(QJsonDocument::Compact) + "\n");
+        }
+    });
+
+    // === WATCHDOG: раньше зависший процесс ограничивался блокирующим
+    // waitForFinished(300000), который убрали ради асинхронности. С мостом
+    // появился новый способ зависнуть — плагин ждёт ответа на readline(),
+    // который никогда не придёт (баг в диспетчере выше, рассинхрон протокола).
+    // Таймер сбрасывается при любой активности на stdout и убивает процесс
+    // после затянувшегося молчания.
+    auto *watchdog = new QTimer(proc);
+    watchdog->setSingleShot(true);
+    const int watchdogTimeoutMs = 5 * 60 * 1000; // 5 минут без активности
+    QObject::connect(watchdog, &QTimer::timeout, proc, [proc, cfgId]() {
+        qWarning() << "[BRIDGE] Плагин" << cfgId << "не отвечает дольше 5 минут, принудительное завершение.";
+        proc->kill();
+    });
+    QObject::connect(proc, &QProcess::readyReadStandardOutput, watchdog, [watchdog, watchdogTimeoutMs]() {
+        watchdog->start(watchdogTimeoutMs);
+    });
+    watchdog->start(watchdogTimeoutMs);
 
     // Коннект на ошибку запуска/выполнения
     QObject::connect(proc, &QProcess::errorOccurred, proc, [this, proc, cfgId, inputPath](QProcess::ProcessError error) {

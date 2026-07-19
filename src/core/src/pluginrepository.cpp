@@ -11,6 +11,27 @@
 #include <quazip/quazipfile.h>
 
 #include "finwizard/archivemanager.h"
+#include "finwizard/version.h"
+
+namespace {
+// Сравнивает две версии вида "MAJOR.MINOR.PATCH" (частей может быть меньше —
+// недостающие считаются нулями). Возвращает <0, если a < b; 0, если равны;
+// >0, если a > b. Нечисловые/пустые компоненты трактуются как 0, чтобы
+// кривая строка в манифесте не роняла парсинг, а просто вела себя как "0".
+int compareVersions(const QString &a, const QString &b)
+{
+    QStringList partsA = a.split('.');
+    QStringList partsB = b.split('.');
+    int count = qMax(partsA.size(), partsB.size());
+
+    for (int i = 0; i < count; ++i) {
+        int valA = (i < partsA.size()) ? partsA[i].toInt() : 0;
+        int valB = (i < partsB.size()) ? partsB[i].toInt() : 0;
+        if (valA != valB) return valA - valB;
+    }
+    return 0;
+}
+} // namespace
 
 PluginRepository::PluginRepository(QSettings &settings) : m_settings(settings) {}
 
@@ -239,6 +260,24 @@ CachedConfig PluginRepository::parseManifest(const QString &dirPath) const
     cfg.description = obj.value("description").toString().trimmed();
     cfg.configType = obj.value("type").toString("cpp-plugin").trimmed();
 
+    // --- ПРОВЕРКА ВЕРСИИ ---
+    // "version" — собственная версия плагина, чисто информационная, для UI.
+    // "min_engine_version" — минимальная версия FinWizard, которую требует
+    // плагин. Если движок старше — плагин может использовать API/поля
+    // манифеста, которых эта сборка не понимает, поэтому бракуем его здесь,
+    // на этапе парсинга, а не даем ему упасть непонятно как при запуске.
+    cfg.version = obj.value("version").toString("1.0.0").trimmed();
+    cfg.minEngineVersion = obj.value("min_engine_version").toString().trimmed();
+
+    if (!cfg.minEngineVersion.isEmpty() &&
+        compareVersions(FinWizard::kEngineVersion, cfg.minEngineVersion) < 0) {
+        cfg.validationMessage = QString(
+            "Плагин требует версию движка FinWizard %1 или новее (установлена %2). "
+            "Обновите приложение, чтобы использовать этот плагин.")
+            .arg(cfg.minEngineVersion, FinWizard::kEngineVersion);
+        return cfg; // isValid остается false
+    }
+
     // --- УМНЫЙ ПОИСК БИНАРНИКА (КРОССПЛАТФОРМА) ---
     QString dllName;
 
@@ -325,6 +364,7 @@ QMap<QString, QString> PluginRepository::getConfigPreview(int id) const
     preview["name"] = cfg.displayName;
     preview["description"] = cfg.description;
     preview["type"] = cfg.configType;
+    preview["version"] = cfg.version;
 
     // 3. Ищем иконку на диске по точным именам И по маскам "имя_*"
     QStringList nameFilters = {

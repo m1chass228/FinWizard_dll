@@ -19,6 +19,7 @@ target_sources(core
         include/finwizard/pluginrepository.h
         include/finwizard/pluginengine.h
         include/finwizard/iconfig.h
+        include/finwizard/version.h
 )
 
 # Самое главное — добавляем путь к include/

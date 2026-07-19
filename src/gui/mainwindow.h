@@ -46,6 +46,7 @@ private slots:
     void showXlsxContextMenu(const QPoint &pos); // контекстное меню
     void onPluginLogReceived(int id, const QString &text);
     void onPluginReadyChanged(int id, bool success);
+    void onPluginProgress(int id, int percent, const QString &text);
     void updateInterfaceIcons();
     void onDeleteConfigClicked();
     void onClearInputDirButton();
@@ -59,6 +60,7 @@ private:
     Ui::MainWindow *ui;
 
     void clearHoverStyles();
+    void setProgressBarChunkColor(const QString &hexColor);
 
     bool m_needsPluginUpdate = false;
     bool m_needsXlsxUpdate = false;

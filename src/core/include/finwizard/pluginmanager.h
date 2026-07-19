@@ -47,6 +47,13 @@ signals:
     // Сигнал возврата результатов работы плагина (успех, сообщение, путь к итоговому XLSX)
     void pluginFinished(int id, bool success, const QString &message, const QString &outputPath);
 
+    // Живой прогресс от самого выполняющегося плагина (finwizard_sdk.core.update_progress())
+    void pluginProgress(int id, int percent, const QString &text);
+
+    // Живой лог от самого выполняющегося плагина (finwizard_sdk.log()) — НЕ путать
+    // с pluginLogReceived выше, тот только для вывода pip install.
+    void pluginLiveLogReceived(int id, const QString &text);
+
     void infoLogRequested(const QString &text);
 
 private:

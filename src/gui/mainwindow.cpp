@@ -2,6 +2,7 @@
 #include "mainwindow.h"
 #include "finwizard/pluginmanager.h"
 #include "finwizard/archivemanager.h"
+#include "finwizard/version.h"
 #include "ui_mainwindow.h"
 
 #include <QMessageBox>
@@ -71,25 +72,12 @@ void MainWindow::applyShadow(QWidget* w, bool isDark)
 void MainWindow::setupModernComboBox(QComboBox* combo, bool isDark)
 {
     if (!combo) return;
-
-    // ИСПРАВЛЕНИЕ БАГА "СЛОМАННЫЙ СПИСОК ПЛАГИНОВ": раньше здесь подменяли view()
-    // комбобокса на новый QListView и выставляли ему Qt::Popup | Qt::FramelessWindowHint.
-    // Это ломает попап QComboBox на живую — то схлопывается в 0 высоты, то не рисует
-    // айтемы, то не закрывается по клику мимо — поведение зависит от стиля/ОС и крайне
-    // нестабильно. Надежный способ стилизовать выпадающий список — чисто через QSS
-    // селектор `QComboBox QAbstractItemView` (см. main.cpp), без хирургии над view()
-    // и его window flags. Оставляем функцию no-op'ом, чтобы не трогать сигнатуру
-    // и точку вызова в конструкторе.
     Q_UNUSED(combo);
     Q_UNUSED(isDark);
 }
 
 void MainWindow::animateButtonHover(QPushButton* btn)
 {
-    // ВНИМАНИЕ: эта функция нигде не вызывается, и это осознанно. Анимация "geometry"
-    // виджета, лежащего в layout (а любая кнопка на нашем UI лежит в layout), ломается —
-    // layout-менеджер откатывает геометрию на каждый invalidate()/resize. Если понадобится
-    // hover-эффект на кнопке — бери animateHoverEnter/animateHoverLeave (тень, не geometry).
     if (!btn) return;
     auto anim = new QPropertyAnimation(btn, "geometry");
     anim->setDuration(120);
@@ -104,14 +92,6 @@ void MainWindow::animateButtonHover(QPushButton* btn)
 
 void MainWindow::animateHoverEnter(QWidget* w)
 {
-    // ИСПРАВЛЕНИЕ БАГА "СЛОМАННАЯ КНОПКА СТАРТ": здесь раньше анимировалось свойство
-    // "geometry" самого виджета. Проблема в том, что startButton лежит в QHBoxLayout —
-    // а layout-менеджер является ЕДИНСТВЕННЫМ владельцем геометрии своих детей и
-    // откатывает ее на каждый invalidate()/resize/показ. В результате аниматор и layout
-    // дрались за геометрию кнопки одновременно — отсюда дерганье/схлопывание.
-    // Правило: виджет, лежащий в layout, никогда нельзя двигать/ресайзить напрямую.
-    // Вместо этого анимируем существующий QGraphicsDropShadowEffect (см. applyShadow) —
-    // визуально кнопка "приподнимается", а геометрию layout не трогаем вообще.
     if (!w) return;
     auto *effect = qobject_cast<QGraphicsDropShadowEffect*>(w->graphicsEffect());
     if (!effect) return;
@@ -167,7 +147,7 @@ MainWindow::MainWindow(PluginManager *pluginManager, QWidget *parent)
 
     setAcceptDrops(true);
 
-    setWindowTitle("FinWizard dll v1.6.1");
+    setWindowTitle("FinWizard dll v" + FinWizard::kAppVersion);
     setWindowIcon(QIcon(":/res/f_icon.svg"));
 
     if (!m_pluginManager) {
@@ -392,13 +372,39 @@ void MainWindow::setupConnections()
     // --- 5. ПОДПИСКА НА СИГНАЛЫ ДВИЖКА (через менеджер) ---
     connect(m_pluginManager, &PluginManager::pluginLogReceived, this, &MainWindow::onPluginLogReceived);
     connect(m_pluginManager, &PluginManager::pluginReadyChanged, this, &MainWindow::onPluginReadyChanged);
+    connect(m_pluginManager, &PluginManager::pluginProgress, this, &MainWindow::onPluginProgress);
+    connect(m_pluginManager, &PluginManager::pluginLiveLogReceived, this, [this](int id, const QString &text) {
+        Q_UNUSED(id); // Одновременно выполняется максимум один плагин, уточнять ID незачем
+        logMessage(text, false);
+    });
     connect(m_pluginManager, &PluginManager::infoLogRequested, this, [this](const QString &text) {
         logMessage(text, false);
     });
 }
 
+// Переключает цвет заливки прогресс-бара: зеленый в норме, красный при ошибке
+void MainWindow::setProgressBarChunkColor(const QString &hexColor)
+{
+    // Полностью переопределяем styleSheet виджета (а не только ::chunk), потому что
+    // локальный styleSheet виджета не мержится с тем, что было задано в .ui —
+    // последний setStyleSheet на этом же объекте побеждает целиком.
+    ui->pluginProgressBar->setStyleSheet(QString(
+                                             "QProgressBar#pluginProgressBar {"
+                                             "   border: 1px solid #3a3a3a;"
+                                             "   border-radius: 4px;"
+                                             "   text-align: center;"
+                                             "   background-color: transparent;"
+                                             "}"
+                                             "QProgressBar#pluginProgressBar::chunk {"
+                                             "   background-color: %1;"
+                                             "   border-radius: 3px;"
+                                             "}"
+                                             ).arg(hexColor));
+}
+
 // Вспомогательный метод для очистки стилей
 void MainWindow::clearHoverStyles()
+
 {
     if (ui->pluginDropZone->property("dragHover").toBool() == true) {
         ui->pluginDropZone->setProperty("dragHover", false);
@@ -838,6 +844,13 @@ void MainWindow::onStartClicked()
     ui->configComboBox->setEnabled(false);
     ui->startButton->setText("⚙️ Проверка...");
 
+    // Сбрасываем прогресс-бар в пустое состояние для нового запуска. Бар теперь
+    // всегда видим (не прячется/не появляется) — при value=0 заливка ("chunk")
+    // просто не отрисовывается, это и есть "пусто" без отдельной логики видимости.
+    setProgressBarChunkColor("#2ecc71"); // на случай, если предыдущий запуск закончился ошибкой (красным)
+    ui->pluginProgressBar->setValue(0);
+    ui->pluginProgressBar->setFormat("");
+
     // Форсируем мгновенную перерисовку кнопки, чтобы текст обновился на экране.
     // При этом очередь событий не прокручивается, и повторные клики не вызовут Race Condition.
     ui->startButton->repaint();
@@ -849,7 +862,7 @@ void MainWindow::onStartClicked()
         // СЛУЧАЙ 1: Скрипт (или DLL) выполнился мгновенно
         ui->startButton->setEnabled(true);
         ui->configComboBox->setEnabled(true);
-        ui->startButton->setText("🚀 СТАРТ");
+        ui->startButton->setText("СТАРТ");
 
         QString msg = result.value("message").toString();
         QString outPath = result.value("outputPath").toString();
@@ -892,7 +905,7 @@ void MainWindow::onStartClicked()
         // СЛУЧАЙ 3: Обычная ошибка (не смогли загрузить плагин, упал EXE и т.д.)
         ui->startButton->setEnabled(true);
         ui->configComboBox->setEnabled(true);
-        ui->startButton->setText("🚀 СТАРТ");
+        ui->startButton->setText("СТАРТ");
 
         QString error = result.value("error").toString();
         logMessage("Ошибка: " + error, true);
@@ -1380,13 +1393,33 @@ void MainWindow::onPluginLogReceived(int id, const QString &text)
     }
 }
 
+// Живой прогресс от самого плагина (через bridge core.update_progress() из
+// finwizard_sdk.py) — в отличие от onPluginLogReceived, это не установка
+// зависимостей pip, а прогресс выполнения бизнес-логики плагина.
+void MainWindow::onPluginProgress(int id, int percent, const QString &text)
+{
+    Q_UNUSED(id); // Одновременно выполняется максимум один плагин (m_execProcess), уточнять ID незачем
+
+    setProgressBarChunkColor("#2ecc71");
+    ui->pluginProgressBar->setValue(qBound(0, percent, 100));
+    ui->pluginProgressBar->setFormat(text.isEmpty() ? "%p%" : (text + " (%p%)"));
+}
+
 // Этот слот вызывается, когда pip завершил работу (успешно или с ошибкой)
 void MainWindow::onPluginReadyChanged(int id, bool success)
 {
     // Pip закончил работу -> возвращаем кнопкам исходное состояние
     ui->startButton->setEnabled(true);
     ui->configComboBox->setEnabled(true);
-    ui->startButton->setText("🚀 СТАРТ");
+    ui->startButton->setText("СТАРТ");
+
+    if (!success) {
+        // Бар больше не прячется при ошибке — красная заливка на всю ширину
+        // сама по себе сигнализирует "что-то сломалось", нагляднее скрытого бара.
+        setProgressBarChunkColor("#e74c3c");
+        ui->pluginProgressBar->setValue(100);
+        ui->pluginProgressBar->setFormat("Ошибка установки зависимостей");
+    }
 
     if (success) {
         logMessage("Окружение готово, плагин запущен в фоне движком!", false);
@@ -1402,7 +1435,17 @@ void MainWindow::onPluginFinished(int id, bool success, const QString &message, 
     // Возвращаем UI в рабочее состояние
     ui->startButton->setEnabled(true);
     ui->configComboBox->setEnabled(true);
-    ui->startButton->setText("🚀 СТАРТ");
+    ui->startButton->setText("СТАРТ");
+
+    if (success) {
+        setProgressBarChunkColor("#2ecc71");
+        ui->pluginProgressBar->setValue(100);
+        ui->pluginProgressBar->setFormat("Готово (100%)");
+    } else {
+        setProgressBarChunkColor("#e74c3c");
+        ui->pluginProgressBar->setValue(100);
+        ui->pluginProgressBar->setFormat("Ошибка");
+    }
 
     if (success) {
         logMessage("Успех: " + message, false);

@@ -51,6 +51,13 @@ Source: "{#MySourceDir}\imageformats\*"; DestDir: "{app}\imageformats"; Flags: i
 ; 4. Подтягиваем портативный Python
 Source: "..\..\installer\win_python\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+; 5. Общий SDK для python-плагинов (finwizard_sdk.py) — должен лежать ИМЕННО
+; в {app}\python_sdk, потому что bootstrap.py резолвит его через
+; QCoreApplication::applicationDirPath() + "/python_sdk" (см. pluginengine.cpp).
+; Если плагин принес свою копию SDK в архиве (<кэш плагина>\python_sdk) — та
+; версия имеет приоритет, эта используется только как fallback.
+Source: "..\..\installer\python_sdk\*"; DestDir: "{app}\python_sdk"; Flags: ignoreversion recursesubdirs createallsubdirs
+
 [Icons]
 ; Ярлыки в пуске и на рабочем столе
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
