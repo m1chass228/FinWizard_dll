@@ -141,6 +141,25 @@ bool PluginEngine::prepareDependencies(const QString &cacheDir)
 
 bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
 {
+    // Проверка прав доступа к директории плагина перед началом работы
+    QDir cacheDir(cfg.cachePath);
+    if (!cacheDir.exists() && !cacheDir.mkpath(".")) {
+        infoLogRequested("[ОШИБКА ДОСТУПА] Не удалось создать директорию плагина (нет прав доступа): " + cfg.cachePath);
+        qWarning() << "Нет прав на создание директории:" << cfg.cachePath;
+        return false;
+    }
+
+    // Проверка записи файлов в папку
+    QString testMarker = cfg.cachePath + "/.perm_check";
+    QFile testFile(testMarker);
+    if (!testFile.open(QIODevice::WriteOnly)) {
+        infoLogRequested("[ОШИБКА ДОСТУПА] Папка защищена от записи администратором: " + cfg.cachePath);
+        qWarning() << "Нет прав записи в папку:" << cfg.cachePath;
+        return false;
+    }
+    testFile.close();
+    testFile.remove();
+
     QString reqPath = cfg.cachePath + "/requirements.txt";
     if (!QFile::exists(reqPath)) {
         QFile manifestFile(cfg.cachePath + "/manifest.json");

@@ -17,6 +17,7 @@ struct CachedConfig {
     QString configType;
     QString entryPoint;
     QString originalZipPath;
+    QByteArray archiveHash;
     QString cachePath;
     QDateTime lastExtracted;
     QDateTime lastUsed;
@@ -44,9 +45,11 @@ private:
     int nextAvailableId();
     QString createCacheDirForId(int id);
     CachedConfig parseManifest(const QString &dirPath) const;
+    bool isNameAlreadyUsed(const QString &name, int excludeId) const;
 
     std::map<int, CachedConfig> m_configs;
     QSettings &m_settings;
+    QByteArray archiveHash;
 };
 
 #endif // PLUGINREPOSITORY_H

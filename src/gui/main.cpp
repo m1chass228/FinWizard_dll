@@ -6,6 +6,7 @@
 #include <QPushButton>
 #include <QComboBox>
 #include <QListView>
+#include <QTimer>
 
 // Заголовочные файлы для анимаций и эффектов
 #include <QPropertyAnimation>
@@ -31,6 +32,16 @@ int main(int argc, char *argv[])
     qDebug() << "FinWizard dll запущен!";
 
     PluginManager manager;
+
+    // === ОБРАБОТКА АРГУМЕНТОВ КОМАНДНОЙ СТРОКИ (.fwp файлы) ===
+    QString droppedFilePath;
+    if (argc > 1) {
+        QString arg1 = QString::fromLocal8Bit(argv[1]);
+        if (arg1.endsWith(".fwp", Qt::CaseInsensitive)) {
+            droppedFilePath = arg1;
+            qDebug() << "Открыт .fwp файл через ассоциацию:" << droppedFilePath;
+        }
+    }
 
     // Обновлённый стиль с поддержкой Micro-UX и стилизацией ComboBox
     QString globalStyle = R"(
@@ -223,6 +234,18 @@ QComboBox QAbstractItemView {
 
     MainWindow window(&manager);
     window.show();
+
+    // === АВТОМАТИЧЕСКОЕ ДОБАВЛЕНИЕ .fwp ПРИ ЗАПУСКЕ ЧЕРЕЗ АССОЦИАЦИЮ ===
+    if (!droppedFilePath.isEmpty()) {
+        QTimer::singleShot(500, &window, [&window, &manager, droppedFilePath]() {
+            QPair<int, QString> res = manager.addConfigFromArchive(droppedFilePath);
+            if (res.first != -1) {
+                qDebug() << "Плагин успешно добавлен из .fwp файла. ID:" << res.first;
+            } else {
+                qDebug() << "Ошибка добавления .fwp:" << res.second;
+            }
+        });
+    }
 
     return app.exec();
 }

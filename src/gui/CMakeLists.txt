@@ -57,6 +57,12 @@ target_link_libraries(FinWizardGui
         QuaZip::QuaZip
 )
 
+if (CMAKE_BUILD_TYPE STREQUAL "Release")
+    add_definitions(-DQT_NO_DEBUG_OUTPUT)
+    add_compile_options(-O3 -march=x86-64-v3)
+endif()
+
+
 # --- 4. ПУТИ К ЗАГОЛОВОЧНЫМ ФАЙЛАМ ---
 # Используем проектный корень (на уровень выше от src/gui)
 target_include_directories(FinWizardGui PRIVATE

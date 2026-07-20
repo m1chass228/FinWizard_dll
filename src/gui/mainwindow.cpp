@@ -40,6 +40,12 @@
 #include <QFont>
 #include <QBrush>
 
+#if defined(Q_OS_WIN)
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 void MainWindow::fadeIn(QWidget* w)
 {
     if (!w) return;
@@ -197,32 +203,43 @@ MainWindow::~MainWindow()
 
 void MainWindow::initSettingsAndPaths()
 {
-    // --- 1. ПУТИ И НАСТРОЙКИ ---
-
     QString defaultCachePath;
     QString defaultInputPath;
+    getDefaultPaths(defaultCachePath, defaultInputPath);
 
-#if defined(Q_OS_WIN)
-    // Для Windows уходим от C:/Users/Кириллица/AppData во избежание проблем с venv и кодировками
-    defaultCachePath = "C:/ProgramData/FinWizard/plugins-cache";
-    defaultInputPath = "C:/ProgramData/FinWizard/Input";
-#else
-    // Для Linux и остальных ОС оставляем стандартные пути в домашней папке
-    defaultCachePath = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/FinWizard/plugins-cache";
-    defaultInputPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input";
-#endif
+    // Проверяем первый запуск или принудительное переключение по режиму
+    bool isFirstRun = !m_appSettings.contains("cache/path") && !m_appSettings.contains("inputFolder");
 
-    m_configsPath = m_appSettings.value("cache/path", defaultCachePath).toString();
-    m_inputPath = m_appSettings.value("inputFolder", defaultInputPath).toString();
+    if (isFirstRun) {
+        m_configsPath = defaultCachePath;
+        m_inputPath = defaultInputPath;
+        m_appSettings.setValue("cache/path", m_configsPath);
+        m_appSettings.setValue("inputFolder", m_inputPath);
+    } else {
+        m_configsPath = m_appSettings.value("cache/path", defaultCachePath).toString();
+        m_inputPath = m_appSettings.value("inputFolder", defaultInputPath).toString();
+    }
+
+    // Проверка прав доступа к папкам при старте
+    if (!isDirectoryWritable(m_configsPath)) {
+        logMessage("[ОШИБКА ДОСТУПА] Нет прав на запись в папку кэша: " + m_configsPath + ". Сброс на дефолтный путь.", true);
+        m_configsPath = defaultCachePath;
+        m_appSettings.setValue("cache/path", m_configsPath);
+    }
+
+    if (!isDirectoryWritable(m_inputPath)) {
+        logMessage("[ОШИБКА ДОСТУПА] Нет прав на запись в входную папку: " + m_inputPath + ". Сброс на дефолтный путь.", true);
+        m_inputPath = defaultInputPath;
+        m_appSettings.setValue("inputFolder", m_inputPath);
+    }
 
     QDir().mkpath(m_configsPath);
     QDir().mkpath(m_inputPath);
 
-    // --- 2. ИНИЦИАЛИЗАЦИЯ МЕНЕДЖЕРА ---
+    // --- ИНИЦИАЛИЗАЦИЯ МЕНЕДЖЕРА ---
     m_pluginManager->setCacheBasePath(m_configsPath);
     m_pluginManager->refreshPlugins();
 }
-
 void MainWindow::setupCoreComponents()
 {
     m_watchdogTimer = new QTimer(this);
@@ -453,7 +470,9 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
         QFileInfo fi(url.toLocalFile());
         QString ext = fi.suffix().toLower();
         QString compExt = fi.completeSuffix().toLower();
-        if (ext == "zip" || ext == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz")) {
+
+        if (ext == "zip" || ext == "tar" || compExt.endsWith("tar.gz") ||
+            compExt.endsWith("tgz") || ext == "fwp") {
             hasPluginArchive = true;
         }
         if (ext == "xlsx" || ext == "xls") {
@@ -539,7 +558,7 @@ void MainWindow::dropEvent(QDropEvent *event)
         QFileInfo curFi(url.toLocalFile());
         QString curExt = curFi.suffix().toLower();
         QString curCompExt = curFi.completeSuffix().toLower();
-        if (curExt == "zip" || curExt == "tar" || curCompExt.endsWith("tar.gz") || curCompExt.endsWith("tgz")) {
+        if (curExt == "zip" || curExt == "tar" || curExt == "fwp" || curCompExt.endsWith("tar.gz") || curCompExt.endsWith("tgz")) {
             hasAnyArchive = true;
             break;
         }
@@ -550,22 +569,25 @@ void MainWindow::dropEvent(QDropEvent *event)
     // ========================================================================
     if (ui->pluginDropZone->rect().contains(localDropZonePos)) {
         if (!hasAnyArchive) {
-            logMessage("Ошибка: В зону плагинов можно сбрасывать только архивы (ZIP, TAR, TAR.GZ)!", true);
-            QMessageBox::critical(this, "Неверный формат", "Сюда можно сбрасывать только файлы плагинов в формате архивов (.zip, .tar, .tar.gz)!");
+            logMessage("Ошибка: В зону плагинов можно сбрасывать только архивы (ZIP, TAR, FWP, TAR.GZ)!", true);
+            QMessageBox::critical(this, "Неверный формат",
+                                  "Сюда можно сбрасывать только файлы плагинов в формате архивов (.zip, .tar, .tar.gz, .fwp)!");
             event->ignore();
             return;
         }
 
-        // Раньше обрабатывался только urls.first() — если юзер разом кидал несколько
-        // архивов плагинов, остальные молча пропадали без единого сообщения об этом.
         int lastAddedId = -1;
         int addedCount = 0;
+        QStringList errors;
+
         for (const QUrl &url : urls) {
             QString curPath = url.toLocalFile();
             QFileInfo curFi(curPath);
             QString curExt = curFi.suffix().toLower();
             QString curCompExt = curFi.completeSuffix().toLower();
-            bool curIsArchive = (curExt == "zip" || curExt == "tar" || curCompExt.endsWith("tar.gz") || curCompExt.endsWith("tgz"));
+            bool curIsArchive = (curExt == "zip" || curExt == "tar" ||
+                                 curCompExt.endsWith("tar.gz") || curCompExt.endsWith("tgz") ||
+                                 curExt == "fwp");
 
             if (!curIsArchive) {
                 logMessage("Пропущен файл (не архив плагина): " + curFi.fileName(), true);
@@ -573,23 +595,44 @@ void MainWindow::dropEvent(QDropEvent *event)
             }
 
             QPair<int, QString> result = m_pluginManager->addConfigFromArchive(curPath);
+
             if (result.first != -1) {
-                logMessage("Плагин успешно добавлен! ID: " + QString::number(result.first), false);
-                lastAddedId = result.first;
-                addedCount++;
+                if (result.second.contains("уже добавлен", Qt::CaseInsensitive)) {
+                    logMessage("Плагин уже существует: " + curFi.fileName(), false);
+                    QMessageBox::warning(this, "Плагин уже существует",
+                                             "Этот плагин уже добавлен в программу.");
+                    lastAddedId = result.first;
+                } else {
+                    logMessage("Плагин успешно добавлен: " + curFi.fileName() + " (ID: " + QString::number(result.first) + ")", false);
+                    lastAddedId = result.first;
+                    addedCount++;
+                }
             } else {
-                logMessage("Ошибка добавления плагина '" + curFi.fileName() + "': " + result.second, true);
-                QMessageBox::critical(this, "Ошибка добавления плагина", curFi.fileName() + ":\n" + result.second);
+                QString err = curFi.fileName() + ": " + result.second;
+                logMessage("Ошибка добавления: " + err, true);
+                errors << err;
             }
         }
 
         updateConfigList();
 
-        if (lastAddedId != -1) {
-            int newIndex = ui->configComboBox->findData(lastAddedId);
-            if (newIndex != -1) ui->configComboBox->setCurrentIndex(newIndex);
-        } else if (addedCount == 0) {
-            ui->configComboBox->setCurrentIndex(0);
+        if (addedCount > 0 || lastAddedId != -1) {
+            if (lastAddedId != -1) {
+                int newIndex = ui->configComboBox->findData(lastAddedId);
+                if (newIndex != -1) {
+                    ui->configComboBox->setCurrentIndex(newIndex);
+                }
+            }
+
+            if (addedCount > 0) {
+                QMessageBox::information(this, "Успех",
+                                         addedCount == 1 ? "Плагин успешно добавлен!" :
+                                             QString("Успешно добавлено %1 плагинов").arg(addedCount));
+            }
+        }
+
+        if (!errors.isEmpty()) {
+            QMessageBox::warning(this, "Ошибки добавления", errors.join("\n\n"));
         }
 
         event->acceptProposedAction();
@@ -842,7 +885,7 @@ void MainWindow::onStartClicked()
     // Блокируем интерфейс сразу
     ui->startButton->setEnabled(false);
     ui->configComboBox->setEnabled(false);
-    ui->startButton->setText("⚙️ Проверка...");
+    ui->startButton->setText("Проверка...");
 
     // Сбрасываем прогресс-бар в пустое состояние для нового запуска. Бар теперь
     // всегда видим (не прячется/не появляется) — при value=0 заливка ("chunk")
@@ -885,7 +928,7 @@ void MainWindow::onStartClicked()
         logMessage(msg, false);
 
         // Оставляем кнопки заблокированными! Текст меняем на статус ожидания
-        ui->startButton->setText("⏳ Установка библиотек...");
+        ui->startButton->setText("Установка библиотек...");
 
         // Поле ui->fileName НЕ ОЧИЩАЕМ. Функция просто завершает работу.
         // Движок сам перехватит управление и выполнит плагин по окончании pip.
@@ -898,7 +941,7 @@ void MainWindow::onStartClicked()
         QString msg = result.value("error").toString();
         logMessage(msg, false);
 
-        ui->startButton->setText("⚙️ Выполняется...");
+        ui->startButton->setText("Выполняется...");
         // Поле ui->fileName НЕ ОЧИЩАЕМ до реального завершения — это сделает onPluginFinished().
     }
     else {
@@ -1066,23 +1109,12 @@ void MainWindow::onSettingsClicked()
     showConsoleCheck->setChecked(m_appSettings.value("ui/showConsole", false).toBool());
     mainLayout->addWidget(showConsoleCheck);
 
-    // --- ОПРЕДЕЛЕНИЕ КОРРЕКТНЫХ ДЕФОЛТНЫХ ПУТЕЙ БЕЗ КИРИЛЛИЦЫ ДЛЯ WINDOWS ---
     QString defaultCachePath;
     QString defaultInputPath;
+    getDefaultPaths(defaultCachePath, defaultInputPath);
 
-#if defined(Q_OS_WIN)
-    // Уходим от C:/Users/Кириллица/AppData во избежание проблем с venv и кодировками
-    defaultCachePath = "C:/ProgramData/FinWizard/plugins-cache";
-    defaultInputPath = "C:/ProgramData/FinWizard/Input";
-#else
-    // Для Linux и остальных ОС оставляем стандартные пути в домашней папке
-    defaultCachePath = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/FinWizard/plugins-cache";
-    defaultInputPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input";
-#endif
-
-    // Используем лямбду, передавая dlg как родителя для всех создаваемых элементов
     auto createPathRow = [&](const QString &label, const QString &key, const QString &def) {
-        QHBoxLayout *row = new QHBoxLayout(); // Перейдет под управление mainLayout при addLayout
+        QHBoxLayout *row = new QHBoxLayout();
         row->addWidget(new QLabel(label, &dlg));
         QLineEdit *edit = new QLineEdit(m_appSettings.value(key, def).toString(), &dlg);
         QPushButton *btn = new QPushButton("Обзор", &dlg);
@@ -1100,27 +1132,51 @@ void MainWindow::onSettingsClicked()
 
     QLineEdit *resultEdit = createPathRow("Папка для результатов:", "outputFolder",
                                           QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Results");
-
-    // Подставляем кроссплатформенные дефолтные значения, настроенные под Windows
     QLineEdit *inputEdit = createPathRow("Папка для входных файлов:", "inputFolder", defaultInputPath);
     QLineEdit *cacheEdit = createPathRow("Папка кэша плагинов:", "cache/path", defaultCachePath);
 
     QPushButton *saveBtn = new QPushButton("Сохранить", &dlg);
     connect(saveBtn, &QPushButton::clicked, [&]() {
+        QString newCachePath = cacheEdit->text().trimmed();
+        QString newInputPath = inputEdit->text().trimmed();
+        QString newOutputPath = resultEdit->text().trimmed();
+
+        // Проверка прав доступа к выбранным директориям
+        if (!isDirectoryWritable(newCachePath)) {
+            QMessageBox::critical(&dlg, "Ошибка доступа",
+                                  "Отказано в доступе к папке кэша плагинов:\n" + newCachePath +
+                                      "\n\nУбедитесь, что у программы есть права на запись в эту директорию (или запустите от имени администратора).");
+            return;
+        }
+
+        if (!isDirectoryWritable(newInputPath)) {
+            QMessageBox::critical(&dlg, "Ошибка доступа",
+                                  "Отказано в доступе к входной папке:\n" + newInputPath +
+                                      "\n\nУбедитесь, что у программы есть права на запись в эту директорию.");
+            return;
+        }
+
+        if (!isDirectoryWritable(newOutputPath)) {
+            QMessageBox::critical(&dlg, "Ошибка доступа",
+                                  "Отказано в доступе к папке результатов:\n" + newOutputPath +
+                                      "\n\nУбедитесь, что у программы есть права на запись в эту директорию.");
+            return;
+        }
+
         m_appSettings.setValue("autoOpenResultFolder", autoOpenCheck->isChecked());
         m_appSettings.setValue("ui/showConsole", showConsoleCheck->isChecked());
         ui->logTextEdit->setVisible(showConsoleCheck->isChecked());
-        m_appSettings.setValue("outputFolder", resultEdit->text());
-        m_appSettings.setValue("inputFolder", inputEdit->text());
-        m_appSettings.setValue("cache/path", cacheEdit->text());
+        m_appSettings.setValue("outputFolder", newOutputPath);
+        m_appSettings.setValue("inputFolder", newInputPath);
+        m_appSettings.setValue("cache/path", newCachePath);
 
-        m_pluginManager->setCacheBasePath(cacheEdit->text());
+        m_pluginManager->setCacheBasePath(newCachePath);
 
         if (!m_watcher->directories().isEmpty()) {
             m_watcher->removePaths(m_watcher->directories());
         }
-        m_watcher->addPath(inputEdit->text());
-        m_watcher->addPath(cacheEdit->text());
+        m_watcher->addPath(newInputPath);
+        m_watcher->addPath(newCachePath);
 
         updateConfigList();
         updateXlsxList();
@@ -1131,7 +1187,7 @@ void MainWindow::onSettingsClicked()
     QPushButton *cancelBtn = new QPushButton("Отмена", &dlg);
     connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
 
-    QHBoxLayout *btnLayout = new QHBoxLayout(); // Перейдет под управление mainLayout
+    QHBoxLayout *btnLayout = new QHBoxLayout();
     btnLayout->addStretch();
     btnLayout->addWidget(cancelBtn);
     btnLayout->addWidget(saveBtn);
@@ -1247,10 +1303,10 @@ void MainWindow::updateConfigList()
             placeholderItem->setFont(font);
         }
 
-        // 2. Красим пункт добавления (последняя строка) в адаптивный зеленый[cite: 1]
+        // 2. Красим пункт добавления (последняя строка) в адаптивный зеленый
         QStandardItem *addItem = model->item(rowCount - 1);
         if (addItem) {
-            QColor greenColor = isDark ? QColor("#2ecc71") : QColor("#1e8449"); //[cite: 1]
+            QColor greenColor = isDark ? QColor("#2ecc71") : QColor("#1e8449");
             addItem->setForeground(greenColor);
             QFont font = addItem->font();
             font.setItalic(true);
@@ -1325,28 +1381,51 @@ void MainWindow::updateConfigPreview(int configId)
 
 void MainWindow::onAddConfigClicked()
 {
-    // Расширяем фильтр диалогового окна на все наши форматы
-    QString archivePath = QFileDialog::getOpenFileName(this, "Выберите архив плагина",
-                                                       QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
-                                                       "Архивы плагинов (*.zip *.tar *.tar.gz *.tgz)");
-    if (archivePath.isEmpty()) return;
+    QStringList archivePaths = QFileDialog::getOpenFileNames(
+        this,
+        "Выберите архивы плагинов",
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+        "Архивы плагинов (*.zip *.tar *.tar.gz *.tgz *.fwp)"
+        );
 
-    // Переключаем на метод addConfigFromArchive
-    QPair<int, QString> result = m_pluginManager->addConfigFromArchive(archivePath);
+    if (archivePaths.isEmpty()) return;
 
-    int newId = result.first;
-    QString errorMsg = result.second;
+    int lastAddedId = -1;
+    int successCount = 0;
 
-    if (newId != -1) {
-        logMessage("Плагин успешно добавлен! ID: " + QString::number(newId), false);
-        updateConfigList();
+    for (const QString &archivePath : archivePaths) {
+        QFileInfo fi(archivePath);
+        QPair<int, QString> result = m_pluginManager->addConfigFromArchive(archivePath);
 
-        int newIndex = ui->configComboBox->findData(newId);
-        if (newIndex != -1) ui->configComboBox->setCurrentIndex(newIndex);
-    } else {
-        logMessage("Ошибка добавления плагина: " + errorMsg, true);
-        QMessageBox::critical(this, "Ошибка добавления плагина", errorMsg);
-        ui->configComboBox->setCurrentIndex(0);
+        if (result.first != -1) {
+            if (result.second.contains("уже добавлен", Qt::CaseInsensitive)) {
+                QMessageBox::warning(this, "Плагин уже существует",
+                                         "Этот плагин уже добавлен в программу.");
+                lastAddedId = result.first; // всё равно переключаемся
+            } else {
+                logMessage("Плагин успешно добавлен: " + fi.fileName() + " (ID: " + QString::number(result.first) + ")", false);
+                lastAddedId = result.first;
+                successCount++;
+            }
+        } else {
+            logMessage("Ошибка добавления " + fi.fileName() + ": " + result.second, true);
+            QMessageBox::critical(this, "Ошибка", result.second);
+        }
+    }
+
+    updateConfigList();
+
+    if (lastAddedId != -1) {
+        int newIndex = ui->configComboBox->findData(lastAddedId);
+        if (newIndex != -1) {
+            ui->configComboBox->setCurrentIndex(newIndex);
+        }
+    }
+
+    if (successCount > 0) {
+        QMessageBox::information(this, "Успех",
+                                 successCount == 1 ? "Плагин успешно добавлен!" :
+                                     QString("Успешно добавлено %1 плагинов").arg(successCount));
     }
 }
 
@@ -1389,7 +1468,7 @@ void MainWindow::onPluginLogReceived(int id, const QString &text)
     // Убираем лишний мусор, берем только первые 25 символов для компактности
     QString shortText = text.left(25);
     if (!shortText.isEmpty()) {
-        ui->startButton->setText("⏳ " + shortText + "...");
+        ui->startButton->setText("..." + shortText + "...");
     }
 }
 
@@ -1554,4 +1633,87 @@ void MainWindow::updateInterfaceIcons()
     ui->settingsButton->setIcon(getTintedIcon(":/res/settings_google.svg"));
     ui->clearInputDirButton->setIcon(getTintedIcon(":/res/trash_google.svg"));
     ui->deleteConfigButton->setIcon(getTintedIcon(":/res/trash_google.svg"));
+}
+
+// Проверка: запущена ли программа от администратора / root
+bool MainWindow::isRunAsAdmin()
+{
+#if defined(Q_OS_WIN)
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuthority, 2,
+                                 SECURITY_BUILTIN_DOMAIN_RID,
+                                 DOMAIN_ALIAS_RID_ADMINS,
+                                 0, 0, 0, 0, 0, 0,
+                                 &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin != FALSE;
+#else
+    return geteuid() == 0;
+#endif
+}
+
+// Проверка: находится ли путь программы (exe) в защищенной / админской директории
+bool MainWindow::isAppInAdminLocation()
+{
+    QString appPath = QCoreApplication::applicationDirPath();
+#if defined(Q_OS_WIN)
+    QString progFiles = QDir::toNativeSeparators(QProcessEnvironment::systemEnvironment().value("ProgramFiles"));
+    QString progFilesX86 = QDir::toNativeSeparators(QProcessEnvironment::systemEnvironment().value("ProgramFiles(x86)"));
+    QString winDir = QDir::toNativeSeparators(QProcessEnvironment::systemEnvironment().value("SystemRoot"));
+
+    QString nativeAppPath = QDir::toNativeSeparators(appPath);
+
+    if ((!progFiles.isEmpty() && nativeAppPath.startsWith(progFiles, Qt::CaseInsensitive)) ||
+        (!progFilesX86.isEmpty() && nativeAppPath.startsWith(progFilesX86, Qt::CaseInsensitive)) ||
+        (!winDir.isEmpty() && nativeAppPath.startsWith(winDir, Qt::CaseInsensitive))) {
+        return true;
+    }
+    return false;
+#else
+    return appPath.startsWith("/usr") || appPath.startsWith("/opt") || appPath.startsWith("/sbin") || appPath.startsWith("/bin");
+#endif
+}
+
+// Получение дефолтных путей в зависимости от режима (админский exe + запуск от админа vs обычный юзер)
+void MainWindow::getDefaultPaths(QString &defaultCachePath, QString &defaultInputPath)
+{
+    bool isAdminMode = isRunAsAdmin() && isAppInAdminLocation();
+
+    if (isAdminMode) {
+#if defined(Q_OS_WIN)
+        defaultCachePath = "C:/ProgramData/FinWizard/plugins-cache";
+        defaultInputPath = "C:/ProgramData/FinWizard/Input";
+#else
+        defaultCachePath = "/var/lib/FinWizard/plugins-cache";
+        defaultInputPath = "/var/lib/FinWizard/Input";
+#endif
+    } else {
+        defaultCachePath = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/FinWizard/plugins-cache";
+        defaultInputPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/FinWizard_Input";
+    }
+}
+
+// Проверка доступности директории на чтение и запись
+bool MainWindow::isDirectoryWritable(const QString &dirPath)
+{
+    QDir dir(dirPath);
+    if (!dir.exists()) {
+        if (!dir.mkpath(".")) {
+            return false;
+        }
+    }
+
+    // Пробуем создать временный тест-файл
+    QString testFileName = dirPath + QString("/.perm_test_%1.tmp").arg(QCoreApplication::applicationPid());
+    QFile testFile(testFileName);
+    if (!testFile.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    testFile.close();
+    testFile.remove();
+    return true;
 }

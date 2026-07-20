@@ -8,8 +8,27 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QDebug>
+#include <QString>
 
 namespace fs = std::filesystem;
+
+// --- Кодировка имен файлов внутри архива ---
+// std::filesystem::path, построенный из std::string на Windows, трактует байты
+// как ТЕКУЩУЮ ANSI-кодовую страницу, а НЕ как UTF-8. Имена файлов внутри tar
+// (кириллица, эмодзи и т.п. — архив мог быть собран на Linux/Mac, где имена
+// в UTF-8) при таком построении либо превращаются в "кракозябры", либо приводят
+// к невалидному пути, на котором fs::create_directories/ofstream кидают
+// std::filesystem::filesystem_error — необработанное исключение, которое
+// уронит всё приложение (именно так выглядит "молча крашится" без диалога).
+// Идём через QString::fromUtf8 -> std::wstring: на Windows это однозначно
+// UTF-16, без привязки к системной кодовой странице.
+static fs::path utf8ToPath(const std::string &utf8) {
+#ifdef Q_OS_WIN
+    return fs::path(QString::fromUtf8(utf8.data(), static_cast<int>(utf8.size())).toStdWString());
+#else
+    return fs::path(utf8); // POSIX: fs::path трактует std::string как UTF-8 нативно
+#endif
+}
 
 // Внутренняя структура для маппинга вектора памяти под Си-поток microtar
 struct MemoryTarStream {
@@ -51,7 +70,7 @@ static int mem_close(mtar_t*) {
 static bool safeJoinTarPath(const fs::path& baseDir, const std::string& entryName, fs::path& outPath) {
     if (entryName.empty()) return false;
 
-    fs::path rel(entryName);
+    fs::path rel = utf8ToPath(entryName);
     if (rel.is_absolute()) return false;
 
     fs::path base = baseDir.lexically_normal();
@@ -80,14 +99,15 @@ bool ArchiveManager::extractArchive(const QString &archivePath, const QString &t
 {
     QFileInfo fi(archivePath);
     QString compExt = fi.completeSuffix().toLower();
+    QString suffix = fi.suffix().toLower();
 
-    // Буфер TAR, прочитанный и провалидированный на ЭТАПЕ 1. Переиспользуем его же
-    // на ЭТАПЕ 2, чтобы не читать файл с диска второй раз (TOCTOU: между двумя чтениями
-    // содержимое файла могло измениться) и не декомпрессировать gzip повторно.
+    bool isFwp = (suffix == "fwp");
+    bool isTarGzLike = (compExt.endsWith("tar.gz") || compExt.endsWith("tgz") || isFwp);
+
     std::vector<char> tarBuffer;
 
     // ========================================================================
-    // ЭТАП 1: ВАЛИДАЦИЯ (Сухая проверка структуры БЕЗ создания мусора на диске)
+    // ЭТАП 1: ВАЛИДАЦИЯ
     // ========================================================================
     if (compExt.endsWith("zip")) {
         QuaZip zip(archivePath);
@@ -97,9 +117,10 @@ bool ArchiveManager::extractArchive(const QString &archivePath, const QString &t
         }
         zip.close();
     }
-    else if (compExt == "tar" || compExt.endsWith("tar.gz") || compExt.endsWith("tgz")) {
-        if (compExt == "tar") {
-            std::ifstream in(archivePath.toStdString(), std::ios::binary | std::ios::ate);
+    else if (compExt == "tar" || isTarGzLike) {   // ← ИСПРАВЛЕНО
+        if (compExt == "tar" && !isFwp) {
+            fs::path p = utf8ToPath(archivePath.toStdString());
+            std::ifstream in(p, std::ios::binary | std::ios::ate);
             if (!in.is_open()) return false;
             std::streamsize size = in.tellg();
             in.seekg(0, std::ios::beg);
@@ -112,7 +133,7 @@ bool ArchiveManager::extractArchive(const QString &archivePath, const QString &t
 
         auto [isValid, errorMsg] = validateTarBuffer(tarBuffer);
         if (!isValid) {
-            qWarning() << "[ArchiveManager] Валидация TAR провалена:" << errorMsg;
+            qWarning() << "[ArchiveManager] Валидация TAR/FWP провалена:" << errorMsg;
             return false;
         }
     }
@@ -122,7 +143,7 @@ bool ArchiveManager::extractArchive(const QString &archivePath, const QString &t
     }
 
     // ========================================================================
-    // ЭТАП 2: ФАКТИЧЕСКАЯ РАСПАКОВКА (Сюда дойдем, только если ЭТАП 1 вернул true)
+    // ЭТАП 2: РАСПАКОВКА
     // ========================================================================
     QDir dir(targetDir);
     if (!dir.exists() && !dir.mkpath(".")) {
@@ -136,7 +157,6 @@ bool ArchiveManager::extractArchive(const QString &archivePath, const QString &t
         extractSuccess = !JlCompress::extractDir(archivePath, targetDir).isEmpty();
     }
     else {
-        // TAR / TAR.GZ / TGZ — используем тот же буфер, что и на этапе валидации
         extractSuccess = extractTarFromBuffer(tarBuffer, targetDir);
     }
 
@@ -144,11 +164,25 @@ bool ArchiveManager::extractArchive(const QString &archivePath, const QString &t
 }
 
 std::vector<char> ArchiveManager::decompressGzip(const std::string& gzFilePath) {
-    gzFile file = gzopen(gzFilePath.c_str(), "rb");
-    if (!file) return {};
+    gzFile file = nullptr;
+
+#ifdef Q_OS_WIN
+    // На Windows переводим UTF-8 путь в UTF-16 (std::wstring) и используем gzopen_w
+    std::wstring wPath = QString::fromUtf8(gzFilePath.data(), static_cast<int>(gzFilePath.size())).toStdWString();
+    file = gzopen_w(wPath.c_str(), "rb");
+#else
+    // На Linux / POSIX системной кодировкой путей является UTF-8, подходит обычный gzopen
+    file = gzopen(gzFilePath.c_str(), "rb");
+#endif
+
+    if (!file) {
+        qWarning() << "[ArchiveManager] Не удалось открыть gz-файл (проверьте путь и права):"
+                   << QString::fromUtf8(gzFilePath.data(), static_cast<int>(gzFilePath.size()));
+        return {};
+    }
 
     std::vector<char> buffer;
-    char chunk[4096];
+    char chunk[8192];
     int bytesRead = 0;
 
     while ((bytesRead = gzread(file, chunk, sizeof(chunk))) > 0) {
@@ -156,7 +190,11 @@ std::vector<char> ArchiveManager::decompressGzip(const std::string& gzFilePath) 
     }
     gzclose(file);
 
-    if (bytesRead < 0) return {}; // Ошибка декомпрессии zlib
+    if (bytesRead < 0) {
+        qWarning() << "[ArchiveManager] Ошибка чтения/распаковки zlib-потока";
+        return {};
+    }
+
     return buffer;
 }
 
@@ -225,6 +263,16 @@ QPair<bool, QString> ArchiveManager::validateTarBuffer(const std::vector<char>& 
 bool ArchiveManager::extractTarFromBuffer(const std::vector<char>& tarBuffer, const QString& destDir) {
     if (tarBuffer.empty()) return false;
 
+    // На Windows тоже идем через wide-string, а не toStdString(): путь кэша
+    // сам может содержать не-ASCII (например, кириллическое имя пользователя
+    // в "C:\Users\<Имя>\AppData\..."), и та же проблема с ANSI-кодовой
+    // страницей применима и к нему, не только к именам файлов внутри архива.
+#ifdef Q_OS_WIN
+    const fs::path baseDir = fs::path(destDir.toStdWString());
+#else
+    const fs::path baseDir = fs::path(destDir.toStdString());
+#endif
+
     mtar_t tar;
     std::memset(&tar, 0, sizeof(tar));
 
@@ -234,45 +282,56 @@ bool ArchiveManager::extractTarFromBuffer(const std::vector<char>& tarBuffer, co
     tar.seek = mem_seek;
     tar.close = mem_close;
 
-    const fs::path baseDir = fs::path(destDir.toStdString());
-
     mtar_header_t header;
     int status;
-    while ((status = mtar_read_header(&tar, &header)) == MTAR_ESUCCESS) {
-        fs::path targetPath;
-        if (!safeJoinTarPath(baseDir, header.name, targetPath)) {
-            qWarning() << "[ArchiveManager] Обнаружена попытка выхода за пределы целевой папки (path traversal), запись отклонена:" << header.name;
-            mtar_close(&tar);
-            return false;
-        }
 
-        if (header.type == MTAR_TDIR) {
-            fs::create_directories(targetPath);
-        } else if (header.type == MTAR_TREG) {
-            if (targetPath.has_parent_path()) {
-                fs::create_directories(targetPath.parent_path());
-            }
-
-            std::ofstream outFile(targetPath, std::ios::binary);
-            if (!outFile.is_open()) {
+    // ВСЯ работа с std::filesystem/std::ofstream обернута в try/catch: эти API
+    // кидают исключения (std::filesystem::filesystem_error, ios_base::failure)
+    // на вещах вроде "путь длиннее MAX_PATH", "файл занят другим процессом",
+    // "диск переполнен" — раньше ни одно из них не ловилось нигде по цепочке
+    // вызовов, и необработанное исключение роняло всё приложение без единого
+    // диалога об ошибке ("аварийно завершилась" в логе — именно это).
+    try {
+        while ((status = mtar_read_header(&tar, &header)) == MTAR_ESUCCESS) {
+            fs::path targetPath;
+            if (!safeJoinTarPath(baseDir, header.name, targetPath)) {
+                qWarning() << "[ArchiveManager] Обнаружена попытка выхода за пределы целевой папки (path traversal), запись отклонена:" << header.name;
                 mtar_close(&tar);
                 return false;
             }
 
-            if (header.size > 0) {
-                std::vector<char> fileData(header.size);
-                if (mtar_read_data(&tar, fileData.data(), header.size) != MTAR_ESUCCESS) {
-                    outFile.close();
+            if (header.type == MTAR_TDIR) {
+                fs::create_directories(targetPath);
+            } else if (header.type == MTAR_TREG) {
+                if (targetPath.has_parent_path()) {
+                    fs::create_directories(targetPath.parent_path());
+                }
+
+                std::ofstream outFile(targetPath, std::ios::binary);
+                if (!outFile.is_open()) {
                     mtar_close(&tar);
                     return false;
                 }
-                outFile.write(fileData.data(), header.size);
-            }
-            outFile.close();
-        }
 
-        status = mtar_next(&tar);
-        if (status != MTAR_ESUCCESS) break;
+                if (header.size > 0) {
+                    std::vector<char> fileData(header.size);
+                    if (mtar_read_data(&tar, fileData.data(), header.size) != MTAR_ESUCCESS) {
+                        outFile.close();
+                        mtar_close(&tar);
+                        return false;
+                    }
+                    outFile.write(fileData.data(), header.size);
+                }
+                outFile.close();
+            }
+
+            status = mtar_next(&tar);
+            if (status != MTAR_ESUCCESS) break;
+        }
+    } catch (const std::exception &e) {
+        qWarning() << "[ArchiveManager] Исключение при распаковке архива (путь/диск/права):" << e.what();
+        mtar_close(&tar);
+        return false;
     }
 
     mtar_close(&tar);

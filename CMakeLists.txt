@@ -20,8 +20,18 @@ if(WIN32)
     set(QUAZIP_USE_QT_ZLIB OFF CACHE BOOL "" FORCE)
 
     set(ZLIB_FOUND TRUE)
-    set(ZLIB_INCLUDE_DIR "C:/Qt/6.11.1/mingw_64/include/QtZlib" CACHE PATH "" FORCE)
-    # Возвращаем железный путь к статике
+    # ВАЖНО: заголовки должны быть от ТОГО ЖЕ zlib, с которым линкуемся ниже
+    # (libz.a из поставки MinGW-тулчейна), а не от Qt/include/QtZlib — тот
+    # zlib приватный для Qt6Core.dll, его символы ждут DLL-импорт (__imp_*),
+    # которого для обычной статической libz.a просто не существует. Раньше
+    # это лечили через "-Wl,--defsym,__imp_z_gzopen=gzopen" ниже — но defsym
+    # присваивает символу ЗНАЧЕНИЕ адреса функции, а не ячейку-указатель НА
+    # него, так что "mov rax,[__imp_z_gzopen]; call rax" читал первые 8 байт
+    # машинного кода gzopen как будто это адрес, и прыгал в мусор (см. отладку
+    # 20.07 — SIGSEGV на 0xffffffffbad08949, ровно эти байты). При заголовках
+    # от того же тулчейна gzopen линкуется как обычный статический символ,
+    # никакого __imp_* вообще не генерируется — костыль ниже больше не нужен.
+    set(ZLIB_INCLUDE_DIR "C:/Qt/Tools/mingw1310_64/x86_64-w64-mingw32/include" CACHE PATH "" FORCE)
     set(ZLIB_LIBRARY "C:/Qt/Tools/mingw1310_64/x86_64-w64-mingw32/lib/libz.a" CACHE FILEPATH "" FORCE)
 else()
     set(QUAZIP_USE_QT_ZLIB OFF CACHE BOOL "" FORCE)
@@ -50,19 +60,13 @@ include_directories(
 
 if(WIN32)
     if(TARGET FinWizardGui)
-        # 1. Скармливаем либу напрямую через таргет линковки
+        # Линкуем реальный статический zlib из тулчейна MinGW. Раньше здесь же
+        # стоял блок "-Wl,--defsym,__imp_z_gzopen=gzopen" и еще 5 таких же —
+        # он был нужен только из-за рассинхрона заголовков/библиотеки выше и
+        # реально портил память в рантайме (см. комментарий у ZLIB_INCLUDE_DIR).
+        # С правильными заголовками defsym не нужен вообще: gzopen и все
+        # остальные линкуются как обычные статические символы.
         target_link_libraries(FinWizardGui PRIVATE "C:/Qt/Tools/mingw1310_64/x86_64-w64-mingw32/lib/libz.a")
-
-        # 2. ЯДЕРНЫЙ ХАК: Алиасим импорты на статические символы.
-        # Линкер заменяет __imp_z_gzopen на обычный gzopen прямо в процессе линковки EXE!
-        target_link_options(FinWizardGui PRIVATE
-            "-Wl,--defsym,__imp_z_gzopen=gzopen"
-            "-Wl,--defsym,__imp_z_gzdopen=gzdopen"
-            "-Wl,--defsym,__imp_z_gzflush=gzflush"
-            "-Wl,--defsym,__imp_z_gzclose=gzclose"
-            "-Wl,--defsym,__imp_z_gzread=gzread"
-            "-Wl,--defsym,__imp_z_gzwrite=gzwrite"
-        )
     endif()
 endif()
 

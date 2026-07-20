@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QDebug>
 #include <QSet>
+#include <QCryptographicHash>
 
 #include <quazip/quazip.h>
 #include <quazip/quazipfile.h>
@@ -39,14 +40,25 @@ PluginRepository::PluginRepository(QSettings &settings) : m_settings(settings) {
 // ----------------- AVAILABLE ID ------------------------------
 
 int PluginRepository::nextAvailableId() {
-    int lastId = m_settings.value("plugins/last_used_id", 0).toInt();
-    int nextId = lastId + 1;
-
     QString base = getCacheBasePath();
-    while (QDir(base + QDir::separator() + QString::number(nextId)).exists()) {
-        nextId++;
+    QDir cacheDir(base);
+
+    if (!cacheDir.exists()) {
+        cacheDir.mkpath(".");
     }
 
+    // Ищем самый маленький свободный ID начиная с 1
+    for (int id = 1; id < 10000; ++id) {  // разумный лимит
+        QString dirName = QString::number(id);
+        if (!QDir(base + "/" + dirName).exists()) {
+            m_settings.setValue("plugins/last_used_id", id);
+            return id;
+        }
+    }
+
+    // Если вдруг всё забито (маловероятно)
+    int lastId = m_settings.value("plugins/last_used_id", 0).toInt();
+    int nextId = qMax(lastId + 1, 1);
     m_settings.setValue("plugins/last_used_id", nextId);
     return nextId;
 }
@@ -71,59 +83,95 @@ QList<int> PluginRepository::getAllConfigIds() const {
 QPair<int, QString> PluginRepository::addConfigFromArchive(const QString &filePath)
 {
     if (!QFile::exists(filePath)) {
-        return {-1, "Файл не существует или недоступен для чтения."};
+        return {-1, "Файл не существует."};
     }
 
     QFileInfo fi(filePath);
 
-    // 1. Проверяем, не добавляли ли мы этот файл ранее
-    int existingId = -1;
-    for (const auto &[id, cfg] : m_configs) {
-        if (cfg.originalZipPath == filePath) {
-            existingId = id;
-            break;
+    // 1. Хэш ДО распаковки
+    QByteArray fileHash;
+    {
+        QFile f(filePath);
+        if (f.open(QIODevice::ReadOnly)) {
+            QCryptographicHash hash(QCryptographicHash::Md5);
+            char buffer[64*1024];
+            while (!f.atEnd()) {
+                qint64 bytes = f.read(buffer, sizeof(buffer));
+                if (bytes > 0) hash.addData(QByteArrayView(buffer, bytes));
+            }
+            fileHash = hash.result();
         }
     }
 
-    if (existingId != -1) {
-        const auto &old = m_configs[existingId];
-        if (fi.lastModified() <= old.lastExtracted) {
-            m_configs[existingId].lastUsed = QDateTime::currentDateTime();
-            return {existingId, ""};
+    qDebug() << "Хэш:" << fileHash.toHex().left(16);
+
+    // 2. Проверка дубликата
+    for (const auto &[exId, exCfg] : m_configs) {
+        if (exCfg.archiveHash == fileHash) {
+            m_configs[exId].lastUsed = QDateTime::currentDateTime();
+            qDebug() << "Дубликат найден по хэшу, ID:" << exId;
+            return {exId, "Плагин уже добавлен ранее."};
         }
-        QDir(old.cachePath).removeRecursively();
-        m_configs.erase(existingId);
     }
 
-    // 2. Выделяем ID и создаем директорию кэша
-    int id = (existingId != -1) ? existingId : nextAvailableId();
+    // 3. Распаковка
+    int id = nextAvailableId();
     QString cacheDir = createCacheDirForId(id);
+    if (cacheDir.isEmpty()) return {-1, "Не удалось создать папку."};
 
-    if (cacheDir.isEmpty()) {
-        return {-1, "Не удалось создать папку кэша."};
-    }
-
-    // 3. УНИВЕРСАЛЬНАЯ РАСПАКОВКА ЧЕРЕЗ ARCHIVEMANAGER
     if (!ArchiveManager::extractArchive(filePath, cacheDir)) {
         QDir(cacheDir).removeRecursively();
-        return {-1, "Не удалось открыть или распаковать архив. Возможно, файл поврежден или не поддерживается."};
+        return {-1, "Ошибка распаковки."};
     }
 
-    // 4. ВАЛИДАЦИЯ МАНИФЕСТА
+    // 4. Парсинг
     CachedConfig cfg = parseManifest(cacheDir);
     if (!cfg.isValid) {
         QDir(cacheDir).removeRecursively();
-        return {-1, "Ошибка в манифесте плагина:\n" + cfg.validationMessage};
+        return {-1, "Ошибка манифеста."};
     }
 
-    // 5. Сохраняем валидный конфиг в память
+    // 5. Имя с суффиксом
+    QString baseName = cfg.displayName.trimmed();
+    if (baseName.isEmpty()) baseName = fi.baseName();
+
+    QString candidate = baseName;
+    int suffix = 1;
+    while (true) {
+        bool dup = false;
+        for (const auto &[exId, exCfg] : m_configs) {
+            if (exCfg.displayName.compare(candidate, Qt::CaseInsensitive) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) break;
+        candidate = baseName + " (" + QString::number(suffix++) + ")";
+    }
+    cfg.displayName = candidate;
+
+    // 6. Сохраняем хэш
+    cfg.archiveHash = fileHash;
     cfg.id = id;
-    cfg.originalZipPath = filePath;
+    cfg.originalZipPath = filePath;  // на всякий
     cfg.lastExtracted = QDateTime::currentDateTime();
     cfg.lastUsed = cfg.lastExtracted;
-    if (cfg.displayName.isEmpty()) cfg.displayName = fi.baseName();
+
+    // 7. Записываем хэш в manifest.json
+    QFile manifestFile(cacheDir + "/manifest.json");
+    if (manifestFile.open(QIODevice::ReadWrite)) {
+        QJsonDocument doc = QJsonDocument::fromJson(manifestFile.readAll());
+        QJsonObject obj = doc.object();
+        obj["archive_hash"] = QString(fileHash.toHex());
+        doc.setObject(obj);
+        manifestFile.seek(0);
+        manifestFile.write(doc.toJson());
+        manifestFile.resize(manifestFile.pos());
+        manifestFile.close();
+    }
 
     m_configs[id] = std::move(cfg);
+
     return {id, ""};
 }
 
@@ -141,51 +189,61 @@ void PluginRepository::removeConfig(int id)
 // -----------------  REFRESH PLUGINS  ----------------------------
 void PluginRepository::refreshPlugins()
 {
-    QString defaultPath = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    if (defaultPath.isEmpty()) {
-        defaultPath = QDir::tempPath() + "/FinWizard_cache";
-    }
-    defaultPath = QDir::cleanPath(defaultPath + "/plugins-cache");
+    QString basePath = getCacheBasePath();
+    QDir cacheDir(basePath);
 
-    // Читаем из настроек (если ничего нет → вернёт дефолт)
-    QString m_cacheBasePath = m_settings.value("cache/path", defaultPath).toString();
+    qDebug() << "--- SCANNING CACHE --- Path:" << basePath;
 
-    qDebug() << "--- SCANNING CACHE ---";
-    qDebug() << "Path:" << m_cacheBasePath;
-
-    qDebug() << "Обновление списка плагинов из:" << m_cacheBasePath;
-
-    // 1. Очищаем текущий кэш описаний (НЕ лоадеры!)
-    // Мы оставляем m_loaders и m_activeConfigs нетронутыми,
-    // чтобы работающие плагины не "отвалились".
     m_configs.clear();
 
-    QDir cacheDir(m_cacheBasePath);
     if (!cacheDir.exists()) {
-        qDebug() << "CRITICAL: Cache directory does not exist!";
+        qDebug() << "Cache directory does not exist!";
         return;
     }
-    // 2. Итерируемся по подпапкам (каждая подпапка - один плагин)
+
     QStringList subDirs = cacheDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-    qDebug() << "Found subdirectories:" << subDirs;
 
     for (const QString &dirName : subDirs) {
-        int id = dirName.toInt(); // если у тебя папки называются по ID
-        if (id <= 0) continue;
+        bool ok = false;
+        int id = dirName.toInt(&ok);
+        if (!ok || id <= 0) {
+            QDir(cacheDir.absoluteFilePath(dirName)).removeRecursively();
+            continue;
+        }
 
         QString fullPath = cacheDir.absoluteFilePath(dirName);
 
-        // Вызываем твою логику чтения манифеста
+        if (QDir(fullPath).entryList(QDir::Files | QDir::NoDotAndDotDot).isEmpty()) {
+            QDir(fullPath).removeRecursively();
+            continue;
+        }
+
         CachedConfig cfg = parseManifest(fullPath);
         if (cfg.isValid) {
             cfg.id = id;
+
+            // Восстанавливаем хэш из оригинального архива (если есть)
+            if (!cfg.originalZipPath.isEmpty() && QFile::exists(cfg.originalZipPath)) {
+                QFile f(cfg.originalZipPath);
+                if (f.open(QIODevice::ReadOnly)) {
+                    QCryptographicHash hash(QCryptographicHash::Md5);
+                    char buffer[64*1024];
+                    while (!f.atEnd()) {
+                        qint64 bytes = f.read(buffer, sizeof(buffer));
+                        if (bytes > 0) hash.addData(QByteArrayView(buffer, bytes));
+                    }
+                    cfg.archiveHash = hash.result();
+                }
+            }
+
             m_configs[id] = cfg;
+        } else {
+            QDir(fullPath).removeRecursively();
         }
     }
 
     qDebug() << "Найдено валидных конфигов:" << m_configs.size();
 }
-
 // ------------------ CACHE ---------------------
 
 QString PluginRepository::getCacheBasePath() const
@@ -242,6 +300,18 @@ QString PluginRepository::createCacheDirForId(int id)
     return dirPath;
 }
 
+// ----- is name already used -----
+
+bool PluginRepository::isNameAlreadyUsed(const QString &name, int excludeId) const
+{
+    for (const auto &[id, cfg] : m_configs) {
+        if (id != excludeId && cfg.displayName.compare(name, Qt::CaseInsensitive) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // ------------------ PARSE MANIFEST ----------------
 
 CachedConfig PluginRepository::parseManifest(const QString &dirPath) const
@@ -249,6 +319,7 @@ CachedConfig PluginRepository::parseManifest(const QString &dirPath) const
     CachedConfig cfg;
     cfg.isValid = false;
     cfg.cachePath = dirPath;
+    cfg.archiveHash = QByteArray();   // важно
 
     QFile file(dirPath + "/manifest.json");
     if (!file.open(QIODevice::ReadOnly)) {
@@ -263,99 +334,69 @@ CachedConfig PluginRepository::parseManifest(const QString &dirPath) const
                                     .arg(parseErr.errorString()).arg(parseErr.offset);
         return cfg;
     }
+
     QJsonObject obj = doc.object();
     cfg.displayName = obj.value("name").toString().trimmed();
     cfg.description = obj.value("description").toString().trimmed();
     cfg.configType = obj.value("type").toString("cpp-plugin").trimmed();
 
+    QString hashStr = obj.value("archive_hash").toString();
+    if (!hashStr.isEmpty()) {
+        cfg.archiveHash = QByteArray::fromHex(hashStr.toLatin1());
+    }
+
     static const QSet<QString> kKnownTypes = {"python-script", "executable", "cpp-plugin"};
     if (!kKnownTypes.contains(cfg.configType)) {
-        cfg.validationMessage = QString("Неизвестный тип плагина в манифесте: \"%1\". Допустимые значения: python-script, executable, cpp-plugin.")
-                                    .arg(cfg.configType);
+        cfg.validationMessage = QString("Неизвестный тип плагина: \"%1\".").arg(cfg.configType);
         return cfg;
     }
 
-    // --- ПРОВЕРКА ВЕРСИИ ---
-    // "version" — собственная версия плагина, чисто информационная, для UI.
-    // "min_engine_version" — минимальная версия FinWizard, которую требует
-    // плагин. Если движок старше — плагин может использовать API/поля
-    // манифеста, которых эта сборка не понимает, поэтому бракуем его здесь,
-    // на этапе парсинга, а не даем ему упасть непонятно как при запуске.
     cfg.version = obj.value("version").toString("1.0.0").trimmed();
     cfg.minEngineVersion = obj.value("min_engine_version").toString().trimmed();
 
     if (!cfg.minEngineVersion.isEmpty() &&
         compareVersions(FinWizard::kEngineVersion, cfg.minEngineVersion) < 0) {
-        cfg.validationMessage = QString(
-                                    "Плагин требует версию движка FinWizard %1 или новее (установлена %2). "
-                                    "Обновите приложение, чтобы использовать этот плагин.")
-                                    .arg(cfg.minEngineVersion, FinWizard::kEngineVersion);
-        return cfg; // isValid остается false
+        cfg.validationMessage = QString("Требуется версия движка %1 или новее.").arg(cfg.minEngineVersion);
+        return cfg;
     }
 
-    // --- УМНЫЙ ПОИСК БИНАРНИКА (КРОССПЛАТФОРМА) ---
+    // Поиск entryPoint
     QString dllName;
 
 #ifdef Q_OS_WIN
-    if (obj.contains("entry_win")) {
-        dllName = obj.value("entry_win").toString().trimmed();
-    }
+    if (obj.contains("entry_win")) dllName = obj.value("entry_win").toString().trimmed();
 #elif defined(Q_OS_LINUX)
-    if (obj.contains("entry_linux")) {
-        dllName = obj.value("entry_linux").toString().trimmed();
-    }
+    if (obj.contains("entry_linux")) dllName = obj.value("entry_linux").toString().trimmed();
 #elif defined(Q_OS_MAC)
-    if (obj.contains("entry_mac")) {
-        dllName = obj.value("entry_mac").toString().trimmed();
-    }
+    if (obj.contains("entry_mac")) dllName = obj.value("entry_mac").toString().trimmed();
 #endif
 
-    // Fallback: Если ОС-специфичного ключа нет или он пустой, берем универсальный "entry"
     if (dllName.isEmpty() && obj.contains("entry")) {
         dllName = obj.value("entry").toString().trimmed();
     }
-    // ----------------------------------------------
 
     if (!dllName.isEmpty()) {
         cfg.entryPoint = QDir(dirPath).absoluteFilePath(dllName);
 
-        // Защита от path traversal через manifest.json: значение "entry" вида
-        // "../../../etc/something" не должно позволить точке входа плагина
-        // выйти за пределы его собственной папки кэша (dirPath).
         QString normalizedBase = QDir::cleanPath(QDir(dirPath).absolutePath());
         QString normalizedEntry = QDir::cleanPath(cfg.entryPoint);
         if (normalizedEntry != normalizedBase && !normalizedEntry.startsWith(normalizedBase + "/")) {
-            cfg.validationMessage = "Точка входа плагина выходит за пределы папки кэша (недопустимый путь в manifest.json).";
+            cfg.validationMessage = "Недопустимый путь в entry (path traversal).";
             return cfg;
         }
 
         if (QFile::exists(cfg.entryPoint)) {
-            // --- СТРОГАЯ ПРОВЕРКА ТИПОВ И РАСШИРЕНИЙ ---
-
-            // 1. Проверка для Python-скриптов
             if (cfg.configType == "python-script" && !cfg.entryPoint.endsWith(".py", Qt::CaseInsensitive)) {
-                cfg.validationMessage = "Конфиг заявляет тип 'python-script', но файл точки входа не имеет расширения .py";
-                return cfg; // isValid остается false, склад забракует плагин
+                cfg.validationMessage = "Тип python-script, но файл не .py";
+                return cfg;
             }
-
-            // 2. Проверка для исполняемых бинарников (на Windows жестко требуем .exe)
-            if (cfg.configType == "executable") {
-#ifdef Q_OS_WIN
-                if (!cfg.entryPoint.endsWith(".exe", Qt::CaseInsensitive)) {
-                    cfg.validationMessage = "Конфиг заявляет тип 'executable', но файл на Windows должен иметь расширение .exe";
-                    return cfg;
-                }
-#endif
-            }
-
-            // Если все проверки пройдены — плагин легитимен
             cfg.isValid = true;
             cfg.validationMessage = "OK";
         } else {
-            cfg.validationMessage = "Файл плагина не найден: " + dllName;
+            cfg.validationMessage = "Файл не найден: " + dllName;
         }
     } else {
-        cfg.validationMessage = "В манифесте не указан ключ 'entry' или специфичный для ОС";
+        cfg.validationMessage = "Не указан entry в манифесте";
     }
 
     return cfg;

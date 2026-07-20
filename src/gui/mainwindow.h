@@ -85,6 +85,11 @@ private:
     void animateHoverEnter(QWidget* w);
     void animateHoverLeave(QWidget* w);
 
+    bool isRunAsAdmin();
+    bool isAppInAdminLocation();
+    void getDefaultPaths(QString &defaultCachePath, QString &defaultInputPath);
+    bool isDirectoryWritable(const QString &dirPath);
+
     QString m_configsPath;
     QString m_inputPath;
 };

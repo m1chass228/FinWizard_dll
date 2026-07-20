@@ -8,7 +8,7 @@ namespace FinWizard {
 // Версия ВСЕГО ПРИЛОЖЕНИЯ — то, что видит пользователь: заголовок окна,
 // "О программе", апдейтер и т.п. Меняется при каждом релизе — включая чисто
 // косметические правки UI, которые вообще не касаются плагинов.
-inline const QString kAppVersion = "2.9.1";
+inline const QString kAppVersion = "2.10.1";
 
 // Версия КОНТРАКТА ДВИЖКА ПЛАГИНОВ — то, против чего PluginRepository
 // проверяет "min_engine_version" из manifest.json (см. parseManifest).

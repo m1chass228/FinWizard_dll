@@ -31,6 +31,12 @@ target_include_directories(core
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+if (CMAKE_BUILD_TYPE STREQUAL "Release")
+    add_definitions(-DQT_NO_DEBUG_OUTPUT)
+    add_compile_options(-O3 -march=x86-64-v3)
+endif()
+
+
 # Линкуем зависимости
 target_link_libraries(core
     PUBLIC
