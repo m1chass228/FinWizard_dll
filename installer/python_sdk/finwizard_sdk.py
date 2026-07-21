@@ -78,11 +78,20 @@ class EngineBridge:
         self._call_id = itertools.count(1)
         sys.stdout = _StdoutProxy(self)  # everyone else's prints go through log()
 
-    def _send_request(self, action: str, **kwargs):
-        req_id = next(self._call_id)
-        payload = {"id": req_id, "action": action, "params": kwargs}
+    def _write_payload(self, payload: dict):
         self._real_stdout.write(json.dumps(payload) + "\n")
         self._real_stdout.flush()
+
+    def _send_notification(self, action: str, **kwargs):
+        """Fire-and-forget notification (no 'id', no response expected)."""
+        payload = {"action": action, "params": kwargs}
+        self._write_payload(payload)
+
+    def _send_request(self, action: str, **kwargs):
+        """Synchronous round-trip request (expects response with matching id)."""
+        req_id = next(self._call_id)
+        payload = {"id": req_id, "action": action, "params": kwargs}
+        self._write_payload(payload)
 
         line = sys.stdin.readline()
         if not line:
@@ -98,17 +107,15 @@ class EngineBridge:
         return response.get("result")
 
     def log(self, message: str):
-        """Send a line to the host's log window."""
-        self._send_request("log", message=str(message))
+        """Send a line to the host's log window (fire-and-forget)."""
+        self._send_notification("log", message=str(message))
 
     def update_progress(self, percent: int, status_text: str = ""):
-        """Update the progress bar in the host UI. percent: 0-100."""
-        self._send_request("update_progress", percent=percent, text=status_text)
+        """Update the progress bar in the host UI (fire-and-forget). percent: 0-100."""
+        self._send_notification("update_progress", percent=percent, text=status_text)
 
     def get_db_data(self, query_type: str, **params):
-        """Ask the host for small structured data. For anything file-sized,
-        the host should hand back a path instead of inline data - see
-        module docstring."""
+        """Ask the host for small structured data (blocking RPC)."""
         return self._send_request("get_db_data", type=query_type, **params)
 
 
