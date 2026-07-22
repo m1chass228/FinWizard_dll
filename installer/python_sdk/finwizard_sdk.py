@@ -48,35 +48,33 @@ class PluginError(Exception):
 
 
 class _StdoutProxy:
-    """Once EngineBridge takes over the real stdout for the RPC protocol,
-    anything else that writes to sys.stdout (a stray print(), a library's
-    internal logging) gets rerouted here line-by-line instead of
-    corrupting the JSON-lines channel."""
+    """Быстрый прокси: собираем вывод в буфер и отправляем пачками."""
     def __init__(self, bridge):
         self._bridge = bridge
-        self._buf = ""
+        self._buf = []
 
     def write(self, s):
-        self._buf += s
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            if line:
-                self._bridge.log(line)
+        if s == '\n':
+            self.flush()
+        else:
+            self._buf.append(s)
 
     def flush(self):
-        pass
+        if self._buf:
+            line = ''.join(self._buf).rstrip()
+            if line:
+                self._bridge.log(line)
+            self._buf.clear()
+
+    def __del__(self):
+        self.flush()
 
 
 class EngineBridge:
-    """Synchronous request/response channel to the C++ host, one JSON
-    object per line over stdin/stdout. Blocks the plugin process until
-    the host answers - keep requests small and fast (log/progress/small
-    queries), never a whole file."""
-
     def __init__(self):
-        self._real_stdout = sys.stdout   # kept private: only this class writes here
+        self._real_stdout = sys.stdout
         self._call_id = itertools.count(1)
-        sys.stdout = _StdoutProxy(self)  # everyone else's prints go through log()
+        sys.stdout = _StdoutProxy(self)   # ← важное изменение
 
     def _write_payload(self, payload: dict):
         self._real_stdout.write(json.dumps(payload) + "\n")
@@ -95,15 +93,13 @@ class EngineBridge:
 
         line = sys.stdin.readline()
         if not line:
-            raise RuntimeError("Engine disconnected prematurely.")
+            raise RuntimeError("Engine disconnected")
 
         response = json.loads(line)
         if response.get("id") != req_id:
-            raise RuntimeError(
-                f"Protocol desync: expected response id {req_id}, got {response.get('id')}"
-            )
+            raise RuntimeError("Protocol desync")
         if not response.get("success"):
-            raise RuntimeError(response.get("error", "Unknown engine error"))
+            raise RuntimeError(response.get("error", "Unknown error"))
         return response.get("result")
 
     def log(self, message: str):
@@ -117,7 +113,6 @@ class EngineBridge:
     def get_db_data(self, query_type: str, **params):
         """Ask the host for small structured data (blocking RPC)."""
         return self._send_request("get_db_data", type=query_type, **params)
-
 
 core = EngineBridge()
 

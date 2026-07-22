@@ -1,3 +1,4 @@
+
 #define MyOutDir "C:\Projects\Output"
 #define MySourceDir "C:\Projects\FinWizard_dll-main\build\Desktop_Qt_6_11_1_MinGW_64_bit_Release\src\gui"
 
@@ -21,6 +22,9 @@ OutputDir={#MyOutDir}
 OutputBaseFilename=FinWizard_Setup
 Compression=lzma2
 SolidCompression=yes
+
+; --- Уведомление системы об изменении ассоциаций файлов ---
+ChangesAssociations=yes
 
 ; --- РЕШЕНИЕ ПРОБЛЕМЫ С ПРАВАМИ АДМИНИСТРАТОРА ---
 ; adminorlowest: пытается получить права админа, но если пользователь отказывается или у него их нет —
@@ -64,16 +68,12 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Registry]
-; Ассоциация .fwp
+; Регистрация расширения .fwp для текущего пользователя (HKCU)
 Root: HKCU; Subkey: "Software\Classes\.fwp"; ValueType: string; ValueName: ""; ValueData: "FinWizard.Package"; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\FinWizard.Package"; ValueType: string; ValueName: ""; ValueData: "FinWizard Plugin Package"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\FinWizard.Package\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"
 Root: HKCU; Subkey: "Software\Classes\FinWizard.Package\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 
-; Чтобы проводник сразу обновил ассоциации
-Root: HKCU; Subkey: "Software\Classes"; Flags: uninsdeletekey; ValueType: none; ValueName: "FinWizard.Package"
-
 [Run]
 ; Запуск программы после успешной установки
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
-Filename: "regsvr32.exe"; Parameters: "/s /n /i:user ""{app}\{#MyAppExeName}"""; Flags: runhidden
