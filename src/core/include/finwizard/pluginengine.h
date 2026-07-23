@@ -8,6 +8,7 @@
 #include <QProcess>
 #include <QObject>
 #include <functional>
+#include <QJsonObject>
 
 #include "finwizard/iconfig.h"
 #include "finwizard/pluginrepository.h" // Нужен только ради структуры CachedConfig
@@ -47,6 +48,13 @@ public:
         m_bridgeHandler = std::move(handler);
     }
 
+    // Уменьшает счетчик использования каждого разделяемого слота, на который
+    // ссылался этот плагин (через его shared_deps.json), и физически удаляет
+    // слот с диска, если счетчик дошел до нуля — то есть больше НИ ОДИН
+    // плагин его не использует. Вызывать ДО удаления cachePath плагина с
+    // диска (иначе shared_deps.json уже не прочитать).
+    void releasePluginDependencies(int pluginId, const QString &cachePath);
+
 signals:
     void pipLogReady(int id, const QString &text);
     void pipFinished(int id, bool success);
@@ -66,6 +74,29 @@ private:
 
     QString findBaseInterpreter() const;
 
+    // === ОБЩИЙ ПУЛ ЗАВИСИМОСТЕЙ ===
+    // Раньше каждый плагин ставил зависимости в СВОЮ py_deps — два плагина
+    // с одинаковой "openpyxl==3.1.5" качали и ставили её дважды. Теперь
+    // каждая строка зависимости (как есть, текстом) маппится в один и тот
+    // же слот в sharedDepsRoot() — если он там уже установлен ЛЮБЫМ другим
+    // плагином, pip для него вообще не запускается.
+    QString sharedDepsRoot() const;
+    QString depSlotSlug(const QString &depLine) const;
+    QStringList readRequirementLines(const QString &reqPath) const;
+    void writeSharedDepsManifest(const CachedConfig &cfg, const QStringList &depSpecs) const;
+    QJsonObject readSharedDepsIndex() const;
+    void writeSharedDepsIndex(const QJsonObject &index) const;
+    bool installNextPendingDependency();
+
+    // Очередь недостающих (в общем пуле) зависимостей для ТЕКУЩЕГО вызова
+    // setupPythonEnvironment(). Один pip-процесс за раз (как и раньше),
+    // просто теперь на каждую строку зависимости, а не на requirements.txt
+    // целиком — очередь опустошается по одной, installNextPendingDependency()
+    // сам себя вызывает на успехе, пока не останется ни одной.
+    QStringList m_pendingSharedInstalls;
+    CachedConfig m_pendingDepsCfg;
+    int m_pendingDepsTotalAtStart = 0;
+
     std::map<int, std::unique_ptr<QPluginLoader>> m_loaders;
     std::map<int, IConfig*> m_activeConfigs;
 
@@ -81,4 +112,4 @@ private:
     std::function<QVariantMap(int, const QString&, const QVariantMap&)> m_bridgeHandler;
 };
 
-#endif // PLUGINENGINE_H1
+#endif // PLUGINENGINE_H

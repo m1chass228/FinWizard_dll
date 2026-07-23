@@ -35,6 +35,8 @@ import json
 import itertools
 import functools
 import traceback
+import time
+import atexit
 from pathlib import Path
 
 
@@ -74,24 +76,35 @@ class EngineBridge:
     def __init__(self):
         self._real_stdout = sys.stdout
         self._call_id = itertools.count(1)
+        self._log_buffer = []
+        self._last_flush = time.monotonic()
         sys.stdout = _StdoutProxy(self)   # ← важное изменение
+        # Гарантирует, что накопленные, но еще не сброшенные строки лога не
+        # потеряются при завершении процесса (в т.ч. через sys.exit()).
+        atexit.register(self.flush_logs)
 
-    def _write_payload(self, payload: dict):
+    def _send_notification(self, action: str, **kwargs):
+        """Пишет сообщение и НЕ ждет ответа. Для log/update_progress —
+        они ничего не возвращают плагину, а блокироваться на readline()
+        на каждую строчку лога было тем самым 100-кратным замедлением:
+        каждый print() внутри плагина превращался в полный IPC round-trip
+        с ожиданием, пока C++ обработает и напишет ответ обратно.
+        Без "id" в сообщении C++-диспетчер знает, что отвечать не нужно."""
+        payload = {"action": action, "params": kwargs}
         self._real_stdout.write(json.dumps(payload) + "\n")
         self._real_stdout.flush()
 
-    def _send_notification(self, action: str, **kwargs):
-        """Fire-and-forget notification (no 'id', no response expected)."""
-        payload = {"action": action, "params": kwargs}
-        self._write_payload(payload)
-
     def _send_request(self, action: str, **kwargs):
-        """Synchronous round-trip request (expects response with matching id)."""
+        """Синхронный запрос-ответ — ТОЛЬКО для того, что реально возвращает
+        значение (get_db_data). Блокируется на readline(), как и раньше."""
+        self.flush_logs()  # лог должен долететь ДО того, как мы заблокируемся в ожидании ответа
+
         req_id = next(self._call_id)
         payload = {"id": req_id, "action": action, "params": kwargs}
-        self._write_payload(payload)
+        self._real_stdout.write(json.dumps(payload) + "\n")
+        self._real_stdout.flush()
 
-        line = sys.stdin.readline()
+        line = sys.stdin.readline().strip()
         if not line:
             raise RuntimeError("Engine disconnected")
 
@@ -103,16 +116,42 @@ class EngineBridge:
         return response.get("result")
 
     def log(self, message: str):
-        """Send a line to the host's log window (fire-and-forget)."""
-        self._send_notification("log", message=str(message))
+        """Буферизуем лог-сообщения и шлём пачками, а не по одному. Плагины
+        вроде salary_birulevo.py печатают тысячи строк в тесных циклах —
+        даже non-blocking запись с flush() на КАЖДУЮ строку остаётся тысячами
+        отдельных системных вызовов записи в pipe. Копим и сбрасываем разом:
+        по достижении размера буфера или по таймауту (что раньше наступит),
+        чтобы живой лог не отставал от реальности на глаз."""
+        self._log_buffer.append(json.dumps({"action": "log", "params": {"message": str(message)}}))
+        now = time.monotonic()
+        if len(self._log_buffer) >= 20 or (now - self._last_flush) > 0.1:
+            self.flush_logs()
+
+    def flush_logs(self):
+        """Сбрасывает накопленный буфер лога ОДНОЙ записью в pipe. C++-сторона
+        читает построчно (canReadLine()/readLine()) независимо от того,
+        сколькими системными вызовами эти строки были записаны — так что
+        склеить их в одну запись здесь совершенно безопасно."""
+        if not self._log_buffer:
+            return
+        self._real_stdout.write("\n".join(self._log_buffer) + "\n")
+        self._real_stdout.flush()
+        self._log_buffer.clear()
+        self._last_flush = time.monotonic()
 
     def update_progress(self, percent: int, status_text: str = ""):
-        """Update the progress bar in the host UI (fire-and-forget). percent: 0-100."""
+        # Сбрасываем лог ПЕРЕД прогрессом, чтобы в UI не было ситуации, когда
+        # бар уже двинулся, а последние строки лога до этого места ещё лежат
+        # в буфере и появятся с запозданием.
+        self.flush_logs()
         self._send_notification("update_progress", percent=percent, text=status_text)
 
     def get_db_data(self, query_type: str, **params):
-        """Ask the host for small structured data (blocking RPC)."""
+        """Ask the host for small structured data. For anything file-sized,
+        the host should hand back a path instead of inline data - see
+        module docstring."""
         return self._send_request("get_db_data", type=query_type, **params)
+
 
 core = EngineBridge()
 
@@ -136,6 +175,7 @@ def write_success(message: str = "", output_path: str = "", **extra):
     """Write a successful result to output.json. `output_path` is a file
     the plugin produced (e.g. a report) - unrelated to the output.json
     path itself."""
+    core.flush_logs()
     result = {"success": True, "message": message, "outputPath": output_path}
     result.update(extra)
     _output_path().write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
@@ -143,6 +183,7 @@ def write_success(message: str = "", output_path: str = "", **extra):
 
 def write_error(error, **extra):
     """Write a failed result to output.json."""
+    core.flush_logs()
     result = {"success": False, "error": str(error)}
     result.update(extra)
     _output_path().write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")

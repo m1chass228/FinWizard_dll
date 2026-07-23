@@ -29,10 +29,15 @@ PluginManager::~PluginManager()
 QPair<int, QString> PluginManager::addConfigFromArchive(const QString &archivePath)
 {
     // 1. Проверяем, загружен ли уже плагин с таким путем архива.
-    // Если да — выгружаем его из движка, чтобы освободить дескрипторы файлов перед перезаписью.
+    // Если да — выгружаем его из движка и освобождаем его зависимости общего
+    // пула, ДО того как репозиторий ниже перезапишет/удалит его cachePath
+    // (для этого же archivePath repository сам удаляет старую папку кэша —
+    // тот путь не проходит через PluginManager::removeConfig, так что
+    // освобождение зависимостей нужно продублировать здесь).
     for (int id : m_repository.getAllConfigIds()) {
         const CachedConfig* cfg = m_repository.getConfig(id);
         if (cfg && cfg->originalZipPath == archivePath) {
+            m_engine.releasePluginDependencies(id, cfg->cachePath);
             m_engine.unloadPlugin(id); // Выгружаем динамическую либу/скрипт
         }
     }
@@ -43,6 +48,14 @@ QPair<int, QString> PluginManager::addConfigFromArchive(const QString &archivePa
 
 void PluginManager::removeConfig(int id)
 {
+    // Освобождаем зависимости общего пула ДО удаления папки плагина —
+    // releasePluginDependencies() читает shared_deps.json из cachePath,
+    // после removeConfig() репозитория читать будет уже нечего.
+    const CachedConfig* cfg = m_repository.getConfig(id);
+    if (cfg) {
+        m_engine.releasePluginDependencies(id, cfg->cachePath);
+    }
+
     // Перед удалением файлов с диска обязательно выгружаем плагин из памяти движка
     m_engine.unloadPlugin(id);
     m_repository.removeConfig(id);

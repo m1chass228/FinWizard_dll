@@ -1,4 +1,5 @@
 #include "finwizard/pluginengine.h"
+#include <utility>
 #include <QCoreApplication>
 #include <QDebug>
 #include <QProcess>
@@ -15,6 +16,7 @@
 #include <QTimer>
 #include <QRegularExpression>
 #include <QTextStream>
+#include <QCryptographicHash>
 
 namespace {
 QProcessEnvironment buildIsolatedPythonEnv(const QString &pythonExePath, const QString &depsDir = QString())
@@ -94,6 +96,292 @@ PluginEngine::~PluginEngine()
 
 // ------------------ PREPARE DEPENCIES ----------------------
 
+// === ОБЩИЙ ПУЛ ЗАВИСИМОСТЕЙ ===
+
+QString PluginEngine::sharedDepsRoot() const
+{
+    QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (base.isEmpty()) {
+        base = QDir::tempPath() + "/FinWizard_shared";
+    }
+    return QDir::cleanPath(base + "/shared_py_deps");
+}
+
+// Строку зависимости ("openpyxl==3.1.5") превращаем в безопасное имя папки.
+// Читаемая часть — для удобства отладки (видно глазами, что там лежит),
+// хэш-хвост — гарантия отсутствия коллизий и защита от небезопасных
+// символов (VCS/URL-зависимости могут содержать что угодно).
+QString PluginEngine::depSlotSlug(const QString &depLine) const
+{
+    QString sanitized = depLine;
+    sanitized.replace(QRegularExpression("[^A-Za-z0-9_.=-]"), "_");
+    sanitized = sanitized.left(60);
+    QByteArray hash = QCryptographicHash::hash(depLine.toUtf8(), QCryptographicHash::Sha1).toHex().left(10);
+    return sanitized + "_" + QString::fromLatin1(hash);
+}
+
+QStringList PluginEngine::readRequirementLines(const QString &reqPath) const
+{
+    QStringList lines;
+    QFile reqFile(reqPath);
+    if (!reqFile.open(QIODevice::ReadOnly | QIODevice::Text)) return lines;
+    QTextStream in(&reqFile);
+    while (!in.atEnd()) {
+        QString line = in.readLine().trimmed();
+        if (!line.isEmpty() && !line.startsWith('#')) lines << line;
+    }
+    return lines;
+}
+
+QJsonObject PluginEngine::readSharedDepsIndex() const
+{
+    QFile f(sharedDepsRoot() + "/index.json");
+    if (!f.open(QIODevice::ReadOnly)) return QJsonObject();
+    QJsonParseError err;
+    QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
+    f.close();
+    if (err.error != QJsonParseError::NoError || !doc.isObject()) return QJsonObject();
+    return doc.object();
+}
+
+void PluginEngine::writeSharedDepsIndex(const QJsonObject &index) const
+{
+    QDir(sharedDepsRoot()).mkpath(".");
+    QFile f(sharedDepsRoot() + "/index.json");
+    if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        f.write(QJsonDocument(index).toJson(QJsonDocument::Indented));
+        f.close();
+    } else {
+        qWarning() << "Не удалось записать index.json общего пула зависимостей";
+    }
+}
+
+// Пишет <cachePath>/shared_deps.json И регистрирует использование каждого
+// слота этим плагином в общем index.json (slug -> {spec, usedBy: [id...]}) —
+// это и есть счетчик ссылок, по которому releasePluginDependencies() ниже
+// решает, можно ли физически удалить слот при удалении плагина.
+void PluginEngine::writeSharedDepsManifest(const CachedConfig &cfg, const QStringList &depSpecs) const
+{
+    QString root = sharedDepsRoot();
+    QJsonArray dirs;
+    QJsonObject index = readSharedDepsIndex();
+
+    for (const QString &spec : depSpecs) {
+        QString slug = depSlotSlug(spec);
+        dirs.append(root + "/" + slug);
+
+        QJsonObject entry = index.value(slug).toObject();
+        QJsonArray usedBy = entry.value("usedBy").toArray();
+        bool alreadyRegistered = false;
+        for (const QJsonValue &v : std::as_const(usedBy)) {
+            if (v.toInt() == cfg.id) { alreadyRegistered = true; break; }
+        }
+        if (!alreadyRegistered) usedBy.append(cfg.id);
+        entry["spec"] = spec;
+        entry["usedBy"] = usedBy;
+        index[slug] = entry;
+    }
+    writeSharedDepsIndex(index);
+
+    QFile f(cfg.cachePath + "/shared_deps.json");
+    if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        f.write(QJsonDocument(dirs).toJson(QJsonDocument::Compact));
+        f.close();
+    } else {
+        qWarning() << "Не удалось записать shared_deps.json для плагина" << cfg.id;
+    }
+}
+
+// Сборка мусора: вызывается ПЕРЕД удалением cachePath плагина. Читает его
+// shared_deps.json (последний шанс это сделать), для каждого использованного
+// слота убирает pluginId из "usedBy" в index.json; если после этого usedBy
+// опустел — слот больше никому не нужен, физически удаляем папку с диска.
+void PluginEngine::releasePluginDependencies(int pluginId, const QString &cachePath)
+{
+    QFile depsFile(cachePath + "/shared_deps.json");
+    if (!depsFile.open(QIODevice::ReadOnly)) return; // не python-script / зависимостей не было
+
+    QJsonParseError err;
+    QJsonDocument doc = QJsonDocument::fromJson(depsFile.readAll(), &err);
+    depsFile.close();
+    if (err.error != QJsonParseError::NoError || !doc.isArray()) return;
+
+    QJsonObject index = readSharedDepsIndex();
+    bool indexChanged = false;
+
+    const QJsonArray arr = doc.array();
+    for (const QJsonValue &v : arr) {
+        QString dir = v.toString();
+        QString slug = QFileInfo(dir).fileName();
+        if (!index.contains(slug)) continue;
+
+        QJsonObject entry = index.value(slug).toObject();
+        QJsonArray usedBy = entry.value("usedBy").toArray();
+        QJsonArray remaining;
+        for (const QJsonValue &idVal : std::as_const(usedBy)) {
+            if (idVal.toInt() != pluginId) remaining.append(idVal);
+        }
+
+        if (remaining.isEmpty()) {
+            if (QDir(dir).removeRecursively()) {
+                qInfo() << "[ОБЩИЙ ПУЛ] Удален неиспользуемый пакет:" << entry.value("spec").toString() << "(" << dir << ")";
+            } else {
+                qWarning() << "[ОБЩИЙ ПУЛ] Не удалось удалить неиспользуемый слот:" << dir;
+            }
+            index.remove(slug);
+        } else {
+            entry["usedBy"] = remaining;
+            index[slug] = entry;
+        }
+        indexChanged = true;
+    }
+
+    if (indexChanged) writeSharedDepsIndex(index);
+}
+
+// Обрабатывает очередь m_pendingSharedInstalls по одному пакету за раз (один
+// pip-процесс единовременно, как и раньше — просто теперь гранулярность не
+// "весь requirements.txt плагина", а "одна строка зависимости общего пула").
+// Сама себя рекурсивно вызывает на успехе следующего пакета, пока очередь не
+// опустеет — тогда пишет shared_deps.json и возобновляет то, ради чего всё
+// затевалось (отложенный запуск плагина или просто pipFinished(true)).
+bool PluginEngine::installNextPendingDependency()
+{
+    // Пропускаем то, что стало готовым, пока мы ждали своей очереди (гонка
+    // с чужим resolve-проходом, поставившим тот же пакет для другого плагина).
+    while (!m_pendingSharedInstalls.isEmpty()) {
+        const QString &spec = m_pendingSharedInstalls.first();
+        QString slotDir = sharedDepsRoot() + "/" + depSlotSlug(spec);
+        if (QFile::exists(slotDir + "/.ready")) {
+            m_pendingSharedInstalls.removeFirst();
+            continue;
+        }
+        break;
+    }
+
+    if (m_pendingSharedInstalls.isEmpty()) {
+        CachedConfig cfg = m_pendingDepsCfg;
+        QStringList allSpecs = readRequirementLines(cfg.cachePath + "/requirements.txt");
+        writeSharedDepsManifest(cfg, allSpecs);
+
+        qInfo() << "Все зависимости общего пула готовы для плагина" << cfg.id;
+
+        if (m_isWaitingForPip && m_delayedCfg.id == cfg.id) {
+            m_isWaitingForPip = false;
+            qInfo() << "[ДВИЖОК] Запускаю отложенный Python-скрипт...";
+            QMetaObject::invokeMethod(this, [this, cfg]() {
+                QString startupError;
+                if (!startExternalProcessAsync(m_delayedCfg, m_delayedParams, startupError)) {
+                    qWarning() << "Не удалось запустить отложенный скрипт:" << startupError;
+                    emit pluginFinished(cfg.id, false, startupError, QString());
+                }
+            }, Qt::QueuedConnection);
+        } else {
+            emit pipFinished(cfg.id, true);
+        }
+        return true;
+    }
+
+    const QString spec = m_pendingSharedInstalls.first();
+    const QString slotDir = sharedDepsRoot() + "/" + depSlotSlug(spec);
+
+    QString currentPython = findBaseInterpreter();
+    if (currentPython.isEmpty() || !QFile::exists(currentPython)) {
+        infoLogRequested("[КРИТИЧЕСКАЯ ОШИБКА] Базовый Python интерпретатор не найден!");
+        m_pendingSharedInstalls.clear();
+        emit pipFinished(m_pendingDepsCfg.id, false);
+        return false;
+    }
+
+    if (!QDir(slotDir).mkpath(".")) {
+        infoLogRequested("[ОШИБКА] Не удалось создать слот общего пула для: " + spec);
+        m_pendingSharedInstalls.clear();
+        emit pipFinished(m_pendingDepsCfg.id, false);
+        return false;
+    }
+
+    if (m_pipProcess) {
+        m_pipProcess->disconnect();
+        m_pipProcess->kill();
+        m_pipProcess->deleteLater();
+        m_pipProcess = nullptr;
+    }
+
+    m_pipProcess = new QProcess(this);
+    QProcess *proc = m_pipProcess;
+    proc->setProcessEnvironment(buildIsolatedPythonEnv(QDir::toNativeSeparators(currentPython)));
+
+    QStringList pipArgs;
+    pipArgs << "-m" << "pip" << "install" << "--target" << QDir::toNativeSeparators(slotDir) << spec;
+
+    const CachedConfig cfgForClosures = m_pendingDepsCfg;
+    const int totalAtStart = m_pendingDepsTotalAtStart;
+    const int doneSoFar = totalAtStart - m_pendingSharedInstalls.size();
+
+    emit pluginProgress(cfgForClosures.id,
+                        totalAtStart > 0 ? qMin(95, static_cast<int>(doneSoFar * 100.0 / totalAtStart)) : 0,
+                        QString("Установка пакета %1/%2: %3").arg(doneSoFar + 1).arg(totalAtStart).arg(spec));
+
+    QObject::connect(proc, &QProcess::readyReadStandardOutput, proc, [this, proc, cfgForClosures]() {
+        QString output = proc->readAllStandardOutput().trimmed();
+        if (!output.isEmpty()) emit pipLogReady(cfgForClosures.id, output);
+    });
+    QObject::connect(proc, &QProcess::readyReadStandardError, proc, [this, proc, cfgForClosures]() {
+        QString errorOutput = proc->readAllStandardError().trimmed();
+        if (!errorOutput.isEmpty()) {
+            qWarning() << "[PIP ERR]:" << errorOutput;
+            emit pipLogReady(cfgForClosures.id, "[ERROR] " + errorOutput);
+        }
+    });
+    QObject::connect(proc, &QProcess::errorOccurred, proc, [this, proc, cfgForClosures](QProcess::ProcessError error) {
+        qWarning() << "PIP ошибка процесса:" << error << proc->errorString();
+        infoLogRequested(QString("[ОШИБКА PIP] Процесс pip не смог стартовать/упал: %1").arg(proc->errorString()));
+        if (m_pipProcess == proc) m_pipProcess = nullptr;
+        m_isWaitingForPip = false;
+        m_pendingSharedInstalls.clear();
+        emit pipFinished(cfgForClosures.id, false);
+        proc->disconnect();
+        proc->deleteLater();
+    });
+    QObject::connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), proc,
+                     [this, proc, cfgForClosures, slotDir, spec](int exitCode, QProcess::ExitStatus exitStatus) {
+                         bool success = (exitStatus == QProcess::NormalExit && exitCode == 0);
+                         if (m_pipProcess == proc) m_pipProcess = nullptr;
+
+                         if (success) {
+                             QFile marker(slotDir + "/.ready");
+                             if (marker.open(QIODevice::WriteOnly)) marker.close();
+                             if (!m_pendingSharedInstalls.isEmpty() && m_pendingSharedInstalls.first() == spec) {
+                                 m_pendingSharedInstalls.removeFirst();
+                             }
+                             proc->deleteLater();
+                             installNextPendingDependency(); // едем дальше по очереди
+                         } else {
+                             qWarning() << "Pip завершился с ошибкой при установке" << spec << ". Код:" << exitCode;
+                             m_isWaitingForPip = false;
+                             m_pendingSharedInstalls.clear();
+                             emit pipFinished(cfgForClosures.id, false);
+                             proc->deleteLater();
+                         }
+                     });
+
+    qInfo() << "Устанавливаю в общий пул:" << spec << "->" << slotDir;
+    proc->start(QDir::toNativeSeparators(currentPython), pipArgs);
+
+    if (!proc->waitForStarted(5000)) {
+        qWarning() << "Не удалось запустить pip процесс:" << proc->errorString();
+        infoLogRequested("[ОШИБКА PIP] Не удалось запустить pip процесс: " + proc->errorString());
+        if (m_pipProcess == proc) m_pipProcess = nullptr;
+        proc->disconnect();
+        proc->deleteLater();
+        m_pendingSharedInstalls.clear();
+        emit pipFinished(cfgForClosures.id, false);
+        return false;
+    }
+
+    return true;
+}
+
 bool PluginEngine::prepareDependencies(const QString &cacheDir)
 {
     // 1. Добавляем папку кэша в пути поиска библиотек Qt
@@ -126,40 +414,17 @@ bool PluginEngine::prepareDependencies(const QString &cacheDir)
     dummyCfg.cachePath = cacheDir;
     dummyCfg.id = 0; // Идентификатор для общей подготовки, если критично
 
-    QString depsDir = cacheDir + "/py_deps";
-    QString installedMarker = depsDir + "/.requirements_installed";
-
-    if (!QFile::exists(installedMarker)) {
-        qInfo() << "[PREPARE] Зависимости плагина еще не установлены. Инициализация сборки...";
-        // Вызываем setupPythonEnvironment. Если для этого конфига не требуются зависимости,
-        // метод вернет true, иначе запустит асинхронный pip.
-        setupPythonEnvironment(dummyCfg);
-    }
+    // С общим пулом зависимостей нет единого маркера "всё готово" на уровне
+    // ЭТОГО плагина (см. sharedDepsRoot()) — просто всегда даём
+    // setupPythonEnvironment шанс проверить. Она сама быстро вернёт true без
+    // единого вызова pip, если все нужные зависимости уже есть в пуле.
+    setupPythonEnvironment(dummyCfg);
 
     return true;
 }
 
 bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
 {
-    // Проверка прав доступа к директории плагина перед началом работы
-    QDir cacheDir(cfg.cachePath);
-    if (!cacheDir.exists() && !cacheDir.mkpath(".")) {
-        infoLogRequested("[ОШИБКА ДОСТУПА] Не удалось создать директорию плагина (нет прав доступа): " + cfg.cachePath);
-        qWarning() << "Нет прав на создание директории:" << cfg.cachePath;
-        return false;
-    }
-
-    // Проверка записи файлов в папку
-    QString testMarker = cfg.cachePath + "/.perm_check";
-    QFile testFile(testMarker);
-    if (!testFile.open(QIODevice::WriteOnly)) {
-        infoLogRequested("[ОШИБКА ДОСТУПА] Папка защищена от записи администратором: " + cfg.cachePath);
-        qWarning() << "Нет прав записи в папку:" << cfg.cachePath;
-        return false;
-    }
-    testFile.close();
-    testFile.remove();
-
     QString reqPath = cfg.cachePath + "/requirements.txt";
     if (!QFile::exists(reqPath)) {
         QFile manifestFile(cfg.cachePath + "/manifest.json");
@@ -190,199 +455,50 @@ bool PluginEngine::setupPythonEnvironment(const CachedConfig &cfg)
                     reqFile.close();
                     qInfo() << "Requirements.txt успешно сгенерирован автоматически.";
                 }
-            } else {
-                QDir(cfg.cachePath + "/py_deps").mkpath(".");
-                QFile marker(cfg.cachePath + "/py_deps/.requirements_installed");
-                if (marker.open(QIODevice::WriteOnly)) {
-                    marker.close();
-                }
-                return true;
             }
+            // Если dependencies пуст/отсутствует — requirements.txt просто не
+            // создаётся, и readRequirementLines() ниже вернёт пустой список —
+            // цикл резолвинга по общему пулу просто не найдёт что ставить.
         }
     }
 
     // ПЕРЕХОД С VENV НА "--target": зависимости плагина теперь ставятся не в
     // изолированное venv-окружение (со своей копией python.exe), а обычным
-    // `pip install --target <depsDir>` от лица ЕДИНСТВЕННОГО базового
+    // `pip install --target <slotDir>` от лица ЕДИНСТВЕННОГО базового
     // интерпретатора. Это устраняет целый класс проблем с портативной
     // embeddable-сборкой Python: там нет модуля venv, а откат на virtualenv
-    // иногда копирует python3xx.dll, который конфликтует с оригиналом
-    // (ImportError: "conflicts with this version of Python"). Раз мы больше
-    // никогда не запускаем второй/скопированный python.exe — такой конфликт
-    // становится физически невозможен.
-    QString depsDir = cfg.cachePath + "/py_deps";
-    QString installedMarker = depsDir + "/.requirements_installed";
+    // иногда копирует python3xx.dll, который конфликтует с оригиналом.
 
-    if (QFile::exists(installedMarker)) {
-        qInfo() << "Зависимости плагина уже установлены, пропускаем pip.";
+    QStringList depSpecs = readRequirementLines(reqPath);
+
+    if (m_pipProcess && m_pipProcess->state() != QProcess::NotRunning) {
+        qWarning() << "Pip уже запущен для другого плагина, отмена.";
+        return false;
+    }
+
+    // Общий пул: каждая строка зависимости мапится в детерминированный слот
+    // (sharedDepsRoot()/depSlotSlug(spec)) — если он уже помечен готовым
+    // (.ready), НИКАКОГО pip для этой строки вообще не запускается, слот
+    // просто идет в shared_deps.json этого плагина как есть.
+    QStringList pending;
+    for (const QString &spec : depSpecs) {
+        QString slotDir = sharedDepsRoot() + "/" + depSlotSlug(spec);
+        if (!QFile::exists(slotDir + "/.ready") && !pending.contains(spec)) {
+            pending << spec;
+        }
+    }
+
+    if (pending.isEmpty()) {
+        writeSharedDepsManifest(cfg, depSpecs);
+        qInfo() << "Все зависимости уже есть в общем пуле, pip не требуется.";
         return true;
     }
 
-    QString currentPython = findBaseInterpreter();
-    if (currentPython.isEmpty()) {
-        infoLogRequested("[КРИТИЧЕСКАЯ ОШИБКА] Базовый Python интерпретатор не найден в системе!");
-        qWarning() << "Критическая ошибка: Базовый Python интерпретатор не найден!";
-        return false;
-    }
+    m_pendingSharedInstalls = pending;
+    m_pendingDepsCfg = cfg;
+    m_pendingDepsTotalAtStart = pending.size();
 
-    // Проверяем физическое наличие файла базового интерпретатора на диске
-    if (!QFile::exists(currentPython)) {
-        infoLogRequested("[ОШИБКА] Файл базового интерпретатора не существует по пути: " + currentPython);
-        qWarning() << "Базовый Python не существует по пути:" << currentPython;
-        return false;
-    }
-
-    if (!QDir(depsDir).mkpath(".")) {
-        infoLogRequested("[ОШИБКА] Не удалось создать папку для зависимостей плагина: " + depsDir);
-        qWarning() << "Не удалось создать папку зависимостей:" << depsDir;
-        return false;
-    }
-
-    QString nativeReqPath = QDir::toNativeSeparators(reqPath);
-    QString nativeDepsDir = QDir::toNativeSeparators(depsDir);
-    QString nativeBasePython = QDir::toNativeSeparators(currentPython);
-
-    // Считаем количество ПРЯМЫХ зависимостей для грубой оценки прогресса ниже.
-    // Это не точный процент (pip дополнительно потянет транзитивные зависимости,
-    // на каждую из которых тоже будет своя строка "Collecting" — счетчик может
-    // обогнать total), поэтому в проценте ниже жестко ограничиваем потолок 95%,
-    // чтобы не показать 100% раньше реального завершения pip.
-    int totalPackages = 0;
-    {
-        QFile reqFileForCount(reqPath);
-        if (reqFileForCount.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QTextStream in(&reqFileForCount);
-            while (!in.atEnd()) {
-                QString line = in.readLine().trimmed();
-                if (!line.isEmpty() && !line.startsWith('#')) totalPackages++;
-            }
-        }
-    }
-
-    // 2. АСИНХРОННЫЙ ЗАПУСК PIP
-    if (m_pipProcess && m_pipProcess->state() != QProcess::NotRunning) {
-        qWarning() << "Pip уже запущен для другого процесса, отмена.";
-        return false;
-    }
-
-    if (m_pipProcess) {
-        m_pipProcess->disconnect();
-        m_pipProcess->kill();
-        m_pipProcess->deleteLater();
-        m_pipProcess = nullptr;
-    }
-
-    m_pipProcess = new QProcess(this);
-    QProcess* proc = m_pipProcess;
-
-    proc->setProcessEnvironment(buildIsolatedPythonEnv(nativeBasePython));
-
-    QStringList pipArgs;
-    pipArgs << "-m" << "pip" << "install" << "--target" << nativeDepsDir << "-r" << nativeReqPath;
-
-    // --- КОННЕКТЫ (Контекст жизни — proc) ---
-
-    QObject::connect(proc, &QProcess::readyReadStandardOutput, proc, [this, proc, cfg, totalPackages]() {
-        QString output = proc->readAllStandardOutput().trimmed();
-        if (!output.isEmpty()) {
-            emit pipLogReady(cfg.id, output);
-
-            // Грубый прогресс "N из M пакетов" по строкам "Collecting <pkg>" —
-            // не байтовый прогресс скачивания (pip его не печатает без tty),
-            // но честно показывает, что процесс двигается, а не завис.
-            if (totalPackages > 0) {
-                QRegularExpression collectingRe("^\\s*Collecting\\s", QRegularExpression::MultilineOption);
-                int newlyCollected = 0;
-                auto it = collectingRe.globalMatch(output);
-                while (it.hasNext()) { it.next(); newlyCollected++; }
-
-                if (newlyCollected > 0) {
-                    int collected = proc->property("fw_collected").toInt() + newlyCollected;
-                    proc->setProperty("fw_collected", collected);
-                    int percent = qMin(95, static_cast<int>(collected * 100.0 / totalPackages));
-                    emit pluginProgress(cfg.id, percent,
-                                        QString("Установка зависимостей: %1/%2").arg(qMin(collected, totalPackages)).arg(totalPackages));
-                }
-            }
-        }
-    });
-
-    QObject::connect(proc, &QProcess::readyReadStandardError, proc, [this, proc, cfg]() {
-        QString errorOutput = proc->readAllStandardError().trimmed();
-        if (!errorOutput.isEmpty()) {
-            qWarning() << "[PIP ERR]:" << errorOutput;
-            emit pipLogReady(cfg.id, "[ERROR] " + errorOutput);
-        }
-    });
-
-    QObject::connect(proc, &QProcess::errorOccurred, proc, [this, proc, cfg](QProcess::ProcessError error) {
-        qWarning() << "PIP ошибка процесса:" << error << proc->errorString();
-        infoLogRequested(QString("[ОШИБКА PIP] Процесс pip не смог стартовать/упал: %1").arg(proc->errorString()));
-        if (m_pipProcess == proc) {
-            m_isWaitingForPip = false;
-            m_pipProcess = nullptr;
-        }
-        emit pipFinished(cfg.id, false);
-        proc->disconnect();
-        proc->deleteLater();
-    });
-
-    QObject::connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), proc,
-                     [this, proc, cfg, installedMarker](int exitCode, QProcess::ExitStatus exitStatus) {
-
-                         bool success = (exitStatus == QProcess::NormalExit && exitCode == 0);
-
-                         if (success) {
-                             qInfo() << "Установка зависимостей успешно завершена!";
-                             QFile marker(installedMarker);
-                             if (marker.open(QIODevice::WriteOnly)) {
-                                 marker.close();
-                             }
-
-                             if (m_isWaitingForPip && m_delayedCfg.id == cfg.id) {
-                                 m_isWaitingForPip = false;
-                                 qInfo() << "[ДВИЖОК] Запускаю отложенный Python-скрипт...";
-
-                                 QMetaObject::invokeMethod(this, [this, cfg]() {
-                                     QString startupError;
-                                     if (!startExternalProcessAsync(m_delayedCfg, m_delayedParams, startupError)) {
-                                         qWarning() << "Не удалось запустить отложенный скрипт:" << startupError;
-                                         emit pluginFinished(cfg.id, false, startupError, QString());
-                                     }
-                                 }, Qt::QueuedConnection);
-
-                             } else {
-                                 emit pipFinished(cfg.id, true);
-                             }
-                         } else {
-                             qWarning() << "Pip завершился с ошибкой. Код:" << exitCode;
-                             if (m_pipProcess == proc) {
-                                 m_isWaitingForPip = false;
-                             }
-                             emit pipFinished(cfg.id, false);
-                         }
-
-                         if (m_pipProcess == proc) {
-                             m_pipProcess = nullptr;
-                         }
-                         proc->deleteLater();
-                     });
-
-    qInfo() << "Запуск асинхронной установки зависимостей для плагина...";
-    proc->start(nativeBasePython, pipArgs);
-
-    if (!proc->waitForStarted(5000)) {
-        qWarning() << "Не удалось запустить pip процесс:" << proc->errorString();
-        infoLogRequested("[ОШИБКА PIP] Не удалось запустить pip процесс: " + proc->errorString());
-        if (m_pipProcess == proc) {
-            m_pipProcess = nullptr;
-        }
-        proc->disconnect();
-        proc->deleteLater();
-        return false;
-    }
-
-    return true;
+    return installNextPendingDependency();
 }
 
 // ------------------- LOAD PLUGIN ---------------------------
@@ -469,10 +585,12 @@ QVariantMap PluginEngine::runPlugin(const CachedConfig &cfg, const QVariantMap &
     if (cfg.configType == "executable" || cfg.configType == "python-script") {
 
         if (cfg.configType == "python-script") {
-            QString depsDir = cfg.cachePath + "/py_deps";
-            QString installedMarker = depsDir + "/.requirements_installed";
-
-            if (!QFile::exists(installedMarker)) {
+            // Готовность зависимостей плагина теперь отмечается наличием
+            // shared_deps.json (пишется в installNextPendingDependency()/
+            // setupPythonEnvironment() после того, как ВСЕ строки его
+            // requirements.txt разрешены в общем пуле) — раньше тут был
+            // персональный маркер py_deps/.requirements_installed.
+            if (!QFile::exists(cfg.cachePath + "/shared_deps.json")) {
                 if (m_pipProcess && m_pipProcess->state() != QProcess::NotRunning) {
                     QVariantMap waitResult;
                     waitResult["success"] = false;
@@ -583,31 +701,44 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
             return false;
         }
 
-        QString depsDir = cfg.cachePath + "/py_deps";
         QString scriptPath = cfg.entryPoint;
         QString bootstrapPath = cfg.cachePath + "/bootstrap.py";
 
         // === КЕШИРОВАНИЕ BOOTSTRAP ===
+        // Список папок общего пула зависимостей теперь читается САМИМ
+        // bootstrap.py из shared_deps.json в рантайме (см. код ниже) — это
+        // значит тело bootstrap.py больше не зависит от того, ЧТО именно
+        // разрешилось в общий пул, только от cachePath/entryPoint этого
+        // плагина, которые не меняются. Поэтому больше не нужна проверка
+        // "маркер новее bootstrap.py" — единственная причина регенерации
+        // теперь версия формата (BOOTSTRAP_FORMAT_VERSION), чтобы кэш от
+        // старого формата (с os.walk по персональной py_deps) не остался
+        // висеть после обновления движка.
+        const int kBootstrapFormatVersion = 2;
         bool bootstrapExists = QFile::exists(bootstrapPath);
-        bool depsChanged = false;
+        bool needsRegeneration = !bootstrapExists;
 
-        // Простая проверка изменения зависимостей (по маркеру)
-        QString markerPath = depsDir + "/.requirements_installed";
         if (bootstrapExists) {
-            QFileInfo bootstrapInfo(bootstrapPath);
-            QFileInfo markerInfo(markerPath);
-            if (markerInfo.exists() && markerInfo.lastModified() > bootstrapInfo.lastModified()) {
-                depsChanged = true;
+            QFile existing(bootstrapPath);
+            if (existing.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                QString firstLine = QTextStream(&existing).readLine();
+                existing.close();
+                if (!firstLine.contains(QString("BOOTSTRAP_FORMAT_VERSION=%1").arg(kBootstrapFormatVersion))) {
+                    needsRegeneration = true;
+                }
+            } else {
+                needsRegeneration = true;
             }
         }
 
-        if (!bootstrapExists || depsChanged) {
+        if (needsRegeneration) {
             QFile bootstrapFile(bootstrapPath);
             if (bootstrapFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
                 QTextStream out(&bootstrapFile);
+                out << "# BOOTSTRAP_FORMAT_VERSION=" << kBootstrapFormatVersion << "\n";
                 out << "import sys\n";
                 out << "import os\n";
-                out << "import site\n\n";
+                out << "import json\n\n";
                 out << "# Bootstrap для FinWizard (кешируется)\n";
                 // SDK — ищем в двух местах, по приоритету:
                 //   1) <cachePath>/python_sdk — плагин принёс СВОЮ копию SDK внутри
@@ -618,21 +749,24 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
                 //   2) <appDir>/python_sdk — общая версия, поставляемая с самим
                 //      приложением, используется как fallback, если плагин свою
                 //      копию не принёс.
-                // Путь не меняется между релизами SDK (меняется только содержимое
-                // файла), поэтому смена версии SDK сама по себе не требует
-                // инвалидации кеша bootstrap.py — только смена deps_dir/маркера ниже.
                 out << "sdk_dir_shared = r'" << QDir::toNativeSeparators(QCoreApplication::applicationDirPath() + "/python_sdk") << "'\n";
                 out << "sdk_dir_bundled = r'" << QDir::toNativeSeparators(cfg.cachePath + "/python_sdk") << "'\n";
                 out << "for _sdk_dir in (sdk_dir_shared, sdk_dir_bundled):\n"; // bundled вставляется последним -> выше приоритетом
                 out << "    if os.path.exists(_sdk_dir) and _sdk_dir not in sys.path:\n";
                 out << "        sys.path.insert(0, _sdk_dir)\n\n";
-                out << "deps_dir = r'" << QDir::toNativeSeparators(depsDir) << "'\n";
-                out << "if os.path.exists(deps_dir):\n";
-                out << "    site.addsitedir(deps_dir)\n";
-                out << "    for root, dirs, files in os.walk(deps_dir):\n";
-                out << "        if root not in sys.path:\n";
-                out << "            sys.path.append(root)\n";
-                out << "    print('[BOOTSTRAP] Зависимости загружены (кеш)')\n\n";
+                // Общий пул зависимостей: shared_deps.json лежит рядом с этим
+                // bootstrap.py (пишет его PluginEngine после того, как все
+                // строки requirements.txt разрешены — либо мгновенно, если
+                // всё уже было в пуле, либо после серии pip install). Читаем
+                // его КАЖДЫЙ запуск, а не запекаем список папок в этот файл —
+                // тогда сам bootstrap.py не надо перегенерировать, даже если
+                // набор зависимостей плагина поменяется.
+                out << "shared_deps_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'shared_deps.json')\n";
+                out << "if os.path.exists(shared_deps_file):\n";
+                out << "    with open(shared_deps_file, 'r', encoding='utf-8') as _f:\n";
+                out << "        for _d in json.load(_f):\n";
+                out << "            if os.path.exists(_d) and _d not in sys.path:\n";
+                out << "                sys.path.insert(0, _d)\n\n";
                 out << "# Запускаем оригинальный скрипт\n";
                 out << "script_path = r'" << QDir::toNativeSeparators(scriptPath) << "'\n";
                 out << "with open(script_path, encoding='utf-8') as f:\n";
@@ -660,8 +794,11 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
 
     qInfo() << "Запуск внешнего процесса (асинхронно):" << program << args;
 
-    QString depsDirForEnv = (cfg.configType == "python-script") ? (cfg.cachePath + "/py_deps") : QString();
-    proc->setProcessEnvironment(buildIsolatedPythonEnv(program, depsDirForEnv));
+    // depsDir больше не единственная папка на плагин — зависимости теперь в
+    // общем пуле (несколько папок), их добавляет в sys.path сам bootstrap.py
+    // из shared_deps.json (см. выше). Так что здесь окружение строим без
+    // PYTHONPATH вообще — как и для pip-процесса.
+    proc->setProcessEnvironment(buildIsolatedPythonEnv(program));
 
     // Локальные копии данных из cfg для безопасного захвата по значению в лямбды
     const int cfgId = cfg.id;
@@ -669,10 +806,11 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
 
     // === RPC-МОСТ: построчный JSON-протокол между плагином и движком ===
     // Отдельный канал от input.json/output.json — только для лёгких сообщений
-    // (log, update_progress, get_db_data) во время выполнения. Плагин пишет
-    // JSON-объект в свой stdout и синхронно блокируется на stdin в ожидании
-    // ответа (см. EngineBridge в finwizard_sdk.py) — поэтому здесь мы обязаны
-    // отвечать на КАЖДЫЙ запрос, иначе плагин зависнет навсегда.
+    // (log, update_progress, get_db_data) во время выполнения. Два вида
+    // сообщений: УВЕДОМЛЕНИЯ (log, update_progress) — без "id", без ответа,
+    // fire-and-forget; и ЗАПРОСЫ (get_db_data и всё через m_bridgeHandler) —
+    // с "id", Python синхронно ждёт ответ на stdin. На уведомление отвечать
+    // НЕЛЬЗЯ (собьёт id следующего реального запроса), на запрос — ОБЯЗАНЫ.
     QObject::connect(proc, &QProcess::readyReadStandardOutput, proc, [this, proc, cfgId]() {
         while (proc->canReadLine()) {
             QByteArray line = proc->readLine().trimmed();
@@ -688,20 +826,31 @@ bool PluginEngine::startExternalProcessAsync(const CachedConfig &cfg, const QVar
             }
 
             QJsonObject req = doc.object();
-            int reqId = req.value("id").toInt();
             QString action = req.value("action").toString();
             QVariantMap params = req.value("params").toObject().toVariantMap();
 
-            QJsonObject resp{{"id", reqId}};
-
+            // log/update_progress — уведомления, не запросы: Python шлёт их
+            // fire-and-forget, НЕ читает ответ (см. EngineBridge._send_notification
+            // в finwizard_sdk.py — раньше синхронный readline() на КАЖДЫЙ
+            // print() плагина давал 100-кратное замедление на "болтливых"
+            // скриптах). Раз Python не читает ответ — мы обязаны его не
+            // писать: иначе он осядет в пайпе и собьёт id следующего
+            // РЕАЛЬНОГО запроса (get_db_data), для которого Python таки
+            // делает readline() и ждёт ИМЕННО свой ответ.
             if (action == "log") {
                 emit pluginLogRequested(cfgId, params.value("message").toString());
-                resp["success"] = true;
-            } else if (action == "update_progress") {
+                continue;
+            }
+            if (action == "update_progress") {
                 emit pluginProgress(cfgId, params.value("percent").toInt(),
                                     params.value("text").toString());
-                resp["success"] = true;
-            } else if (m_bridgeHandler) {
+                continue;
+            }
+
+            int reqId = req.value("id").toInt();
+            QJsonObject resp{{"id", reqId}};
+
+            if (m_bridgeHandler) {
                 // Хук для запросов, специфичных для приложения (get_db_data и т.п.) —
                 // устанавливается снаружи через setBridgeHandler(), движок сам
                 // ничего не знает о БД. Хендлер должен быть быстрым: плагин
